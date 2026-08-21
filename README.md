@@ -50,6 +50,19 @@ Installing the extension does not start an automatic reviewer in the background.
 When you finish implementing, run a reviewer subagent before summarizing.
 ```
 
+### Context-efficient tool surface
+
+The default model-facing `subagent` tool intentionally covers the common paths only: agent listing, one child, and ordinary parallel `calls[]`. Parallel calls are translated internally to the existing `runs.all` workflow engine, so they do not require the large workflow schema.
+
+The uncommon workflow/control contract and `subagent_wait` are progressively disclosed instead of being included in every model request. The small `subagent_capability` loader provides them only when needed:
+
+- `subagent_capability({ mode: "advanced" })` loads the original full `subagent` workflow/control contract.
+- `subagent_capability({ mode: "wait" })` loads `subagent_wait`.
+- `subagent_capability({ mode: "all" })` loads both.
+- The minimal surface is restored after the parent turn finishes.
+
+This changes only the model-facing schema/instructions. The existing executor, async runtime, workflowScript engine, missions, schedules, watchdogs, worktrees, steering, acceptance checks, RPC, and UI remain intact.
+
 ## Builtin agents
 
 The extension ships with agents you can use immediately:
@@ -107,7 +120,7 @@ For bounded orchestration, `maxSubagentSpawnsPerRun` limits cumulative logical c
 
 or ask: "Check whether subagents and intercom are set up correctly."
 
-For installed-version help, use `/subagents-guide [topic]` or `subagent({ action: "guide", topic: "workflows" })`. The default topic is `overview`; available topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, and `extension-api`.
+For installed-version help, use `/subagents-guide [topic]`. For model-driven advanced guide actions, Pi first loads the advanced `subagent` surface through `subagent_capability`. The default topic is `overview`; available topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, and `extension-api`.
 
 ## Documentation
 
