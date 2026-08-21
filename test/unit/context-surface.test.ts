@@ -24,15 +24,16 @@ describe("progressive subagent context surface", () => {
 		const basicBytes = bytes(BasicSubagentParams);
 		const fullBytes = bytes(createSubagentParamsSchema());
 
-		assert.ok(basicBytes < 2_500, `basic schema grew to ${basicBytes} bytes`);
+		assert.ok(basicBytes < 3_500, `basic schema grew to ${basicBytes} bytes`);
 		assert.ok(
 			basicBytes * 4 < fullBytes,
 			`basic schema (${basicBytes} bytes) should stay below 25% of full schema (${fullBytes} bytes)`,
 		);
 	});
 
-	it("does not leak advanced workflow fields into the default contract", () => {
+	it("keeps common parallel fanout but excludes advanced control fields", () => {
 		const schema = JSON.stringify(BasicSubagentParams);
+		assert.match(schema, /calls/);
 		assert.doesNotMatch(schema, /workflowScript/);
 		assert.doesNotMatch(schema, /mission/);
 		assert.doesNotMatch(schema, /schedule/);
@@ -41,9 +42,9 @@ describe("progressive subagent context surface", () => {
 	});
 
 	it("keeps fixed model-facing guidance bounded", () => {
-		assert.ok(Buffer.byteLength(BASIC_SUBAGENT_TOOL_DESCRIPTION) < 600);
-		assert.ok(bytes(SubagentCapabilityParams) < 700);
-		assert.ok(Buffer.byteLength(SUBAGENT_CAPABILITY_DESCRIPTION) < 180);
+		assert.ok(Buffer.byteLength(BASIC_SUBAGENT_TOOL_DESCRIPTION) < 500);
+		assert.ok(bytes(SubagentCapabilityParams) < 600);
+		assert.ok(Buffer.byteLength(SUBAGENT_CAPABILITY_DESCRIPTION) < 120);
 	});
 
 	it("registers the small package surface first and restores the original full contract on demand", () => {
@@ -105,6 +106,7 @@ describe("progressive subagent context surface", () => {
 		};
 
 		assert.equal(result.waitInitiallyRegistered, false);
+		assert.equal(result.initialProperties.includes("calls"), true);
 		assert.equal(result.initialProperties.includes("workflowScript"), false);
 		assert.equal(result.initialProperties.includes("mission"), false);
 		assert.equal(result.advancedProperties.includes("workflowScript"), true);
