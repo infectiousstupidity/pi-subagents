@@ -50,6 +50,19 @@ Installing the extension does not start an automatic reviewer in the background.
 When you finish implementing, run a reviewer subagent before summarizing.
 ```
 
+### Context-efficient tool surface
+
+The default model-facing `subagent` tool intentionally exposes only ordinary one-child delegation and agent listing. The large workflow/control contract and `subagent_wait` are progressively disclosed instead of being included in every model request.
+
+Pi loads them automatically through the small `subagent_capability` tool when needed:
+
+- `subagent_capability({ mode: "advanced" })` loads the full existing `subagent` workflow/control contract.
+- `subagent_capability({ mode: "wait" })` loads `subagent_wait`.
+- `subagent_capability({ mode: "all" })` loads both.
+- The minimal surface is restored after the parent turn finishes.
+
+This changes only the model-facing schema/instructions. The existing executor, async runtime, workflowScript engine, missions, schedules, watchdogs, worktrees, steering, acceptance checks, RPC, and UI remain intact.
+
 ## Builtin agents
 
 The extension ships with agents you can use immediately:
@@ -107,7 +120,7 @@ For bounded orchestration, `maxSubagentSpawnsPerRun` limits cumulative logical c
 
 or ask: "Check whether subagents and intercom are set up correctly."
 
-For installed-version help, use `/subagents-guide [topic]` or `subagent({ action: "guide", topic: "workflows" })`. The default topic is `overview`; available topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, and `extension-api`.
+For installed-version help, use `/subagents-guide [topic]`. For model-driven advanced guide actions, Pi first loads the advanced `subagent` surface through `subagent_capability`. The default topic is `overview`; available topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, and `extension-api`.
 
 ## Documentation
 
