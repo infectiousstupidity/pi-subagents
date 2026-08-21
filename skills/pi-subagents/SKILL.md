@@ -7,7 +7,7 @@ description: |
 
 # Pi Subagents
 
-The parent owns planning, integration, verification, and the final answer. Ordinary children do not orchestrate other children unless explicitly configured for fanout.
+This skill is parent-only; spawned children must not use it unless they were explicitly configured as fanout orchestrators. The parent owns planning, integration, verification, and the final answer.
 
 ## Default path
 
