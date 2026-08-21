@@ -9,26 +9,67 @@ import {
 	SUBAGENT_TOOL_NAME,
 	SUBAGENT_WAIT_TOOL_NAME,
 	SubagentCapabilityParams,
-	waitToolIsConfiguredDisabled,
 } from "./context-surface-contract.ts";
+
+type BasicSubagentInput = {
+	action?: "list";
+	agent?: string;
+	task?: string;
+	calls?: Array<{ agent: string; task: string }>;
+	async?: boolean;
+	context?: "fresh" | "fork" | "profile";
+	cwd?: string;
+	model?: string;
+	worktree?: boolean;
+	timeoutMs?: number;
+};
+
+function buildParallelWorkflowScript(calls: Array<{ agent: string; task: string }>): string {
+	const items = calls.map((call, index) => ({
+		key: `call-${index + 1}`,
+		agent: call.agent,
+		task: call.task,
+	}));
+	return `return await runs.all(${JSON.stringify(items)});`;
+}
+
+function translateBasicParams(params: BasicSubagentInput): Record<string, unknown> {
+	if (!params.calls) return { ...params };
+	const { calls, action: _action, agent: _agent, task: _task, ...defaults } = params;
+	return {
+		...defaults,
+		workflowScript: buildParallelWorkflowScript(calls),
+	};
+}
+
+function validateBasicParams(params: BasicSubagentInput): string | undefined {
+	const hasSingleField = params.agent !== undefined || params.task !== undefined;
+	const hasCalls = params.calls !== undefined;
+
+	if (params.action !== undefined) {
+		if (params.action !== "list") return `Unsupported minimal subagent action: ${params.action}`;
+		if (hasSingleField || hasCalls) return "action cannot be combined with agent/task or calls.";
+		return undefined;
+	}
+	if (hasCalls && hasSingleField) return "Use either agent/task or calls, not both.";
+	if (hasCalls) return params.calls!.length > 0 ? undefined : "calls must contain at least one child.";
+	if ((params.agent === undefined) !== (params.task === undefined)) return "agent and task must be provided together.";
+	if (params.agent === undefined) return "Provide agent/task for one child, calls for parallel children, or action:'list'.";
+	return undefined;
+}
 
 /**
  * Progressive-disclosure wrapper for the parent-facing model tool surface.
  *
  * The full pi-subagents runtime still initializes exactly as before. During
- * registration we capture the large model-facing contracts, expose a small
- * one-child `subagent` contract by default, and restore the full contract only
- * when the model explicitly asks for it through `subagent_capability`.
- *
- * This keeps workflow, mission, scheduling, watchdog, steering, acceptance,
- * worktree, and diagnostic functionality intact without paying for their
- * schemas and instructions on every ordinary model turn.
+ * registration we capture the large model-facing contracts and expose a small
+ * contract for the common single-child and parallel-fanout paths. The original
+ * full tool is restored on demand, so advanced behavior is not reimplemented.
  */
 export default function registerContextOptimizedSubagentExtension(pi: ExtensionAPI): void {
 	let fullSubagentTool: ToolDefinition | undefined;
 	let basicSubagentTool: ToolDefinition | undefined;
 	let waitTool: ToolDefinition | undefined;
-	let waitToolEnabled = false;
 
 	const originalRegisterTool = pi.registerTool.bind(pi) as (tool: ToolDefinition) => void;
 	const mutablePi = pi as ExtensionAPI & { registerTool: (tool: ToolDefinition) => void };
@@ -44,6 +85,35 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 				promptSnippet: BASIC_SUBAGENT_PROMPT_SNIPPET,
 				promptGuidelines: undefined,
 				parameters: BasicSubagentParams,
+				constrainedSampling: false,
+				prepareArguments: undefined,
+				async execute(id, params, signal, onUpdate, ctx) {
+					const basic = params as BasicSubagentInput;
+					const error = validateBasicParams(basic);
+					if (error) {
+						return {
+							content: [{ type: "text", text: error }],
+							details: { mode: "single", results: [] },
+							isError: true,
+						};
+					}
+					return tool.execute(
+						id,
+						translateBasicParams(basic) as never,
+						signal,
+						onUpdate as never,
+						ctx,
+					);
+				},
+				...(tool.renderCall ? {
+					renderCall(args, theme, context) {
+						return tool.renderCall!(
+							translateBasicParams(args as BasicSubagentInput) as never,
+							theme,
+							context as never,
+						);
+					},
+				} : {}),
 			} as ToolDefinition;
 			originalRegisterTool(basicSubagentTool);
 			return;
@@ -51,17 +121,16 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 
 		if (tool.name === SUBAGENT_WAIT_TOOL_NAME) {
 			waitTool = tool;
-			waitToolEnabled = !waitToolIsConfiguredDisabled(tool.description);
-			// Do not register this large contract until it is actually needed.
+			// Do not register this large contract until it is actually requested.
 			return;
 		}
 
 		originalRegisterTool(tool);
 	};
 
-	// ExtensionAPI is a mutable plain object. Intercept registration only while
-	// the existing runtime initializes, then restore the original method so all
-	// later runtime registrations keep normal Pi behavior and object identity.
+	// Pi's ExtensionAPI is a mutable runtime object. Intercept registration only
+	// during the existing extension's synchronous setup, then restore it so the
+	// original runtime keeps the exact same `pi` identity and behavior.
 	mutablePi.registerTool = interceptedRegisterTool as typeof pi.registerTool;
 	try {
 		registerFullSubagentExtension(pi);
@@ -90,13 +159,13 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 		name: SUBAGENT_CAPABILITY_TOOL_NAME,
 		label: "Subagent Capability",
 		description: SUBAGENT_CAPABILITY_DESCRIPTION,
-		promptSnippet: "Load the full subagent contract only for advanced orchestration or explicit waiting.",
+		promptSnippet: "Load advanced subagent controls only when the minimal subagent tool cannot express the task.",
 		parameters: SubagentCapabilityParams,
 		async execute(_id, params) {
 			if (params.mode === "minimal") {
 				restoreMinimalSurface();
 				return {
-					content: [{ type: "text", text: "Restored the minimal subagent tool surface." }],
+					content: [{ type: "text", text: "Restored the minimal subagent surface." }],
 					details: { mode: params.mode },
 				};
 			}
@@ -113,9 +182,9 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 			}
 
 			if (params.mode === "wait" || params.mode === "all") {
-				if (!waitTool || !waitToolEnabled) {
+				if (!waitTool) {
 					return {
-						content: [{ type: "text", text: "subagent_wait is disabled by configuration." }],
+						content: [{ type: "text", text: "subagent_wait is unavailable." }],
 						details: { mode: params.mode },
 						isError: true,
 					};
@@ -125,10 +194,10 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 			}
 
 			const text = params.mode === "advanced"
-				? "Loaded the full subagent workflow/control contract for this turn."
+				? "Loaded the full subagent contract for this parent turn."
 				: params.mode === "wait"
-					? "Loaded subagent_wait for this turn."
-					: "Loaded the full subagent contract and subagent_wait for this turn.";
+					? "Loaded subagent_wait for this parent turn."
+					: "Loaded the full subagent contract and subagent_wait for this parent turn.";
 			return {
 				content: [{ type: "text", text }],
 				details: { mode: params.mode },
@@ -136,12 +205,7 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 		},
 	});
 
-	// A new session and each completed parent turn return to the cheap surface.
-	// Advanced functionality remains available through one tiny capability call.
-	pi.on("session_start", () => {
-		restoreMinimalSurface();
-	});
-	pi.on("agent_end", () => {
-		restoreMinimalSurface();
-	});
+	// Advanced schemas should never become a permanent tax on later requests.
+	pi.on("session_start", restoreMinimalSurface);
+	pi.on("agent_end", restoreMinimalSurface);
 }
