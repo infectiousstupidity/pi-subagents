@@ -24,6 +24,8 @@ type BasicSubagentInput = {
 	timeoutMs?: number;
 };
 
+type CapabilityMode = "advanced" | "wait" | "all" | "minimal";
+
 function buildParallelWorkflowScript(calls: Array<{ agent: string; task: string }>): string {
 	const items = calls.map((call, index) => ({
 		key: `call-${index + 1}`,
@@ -161,7 +163,7 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 		description: SUBAGENT_CAPABILITY_DESCRIPTION,
 		promptSnippet: "Load advanced subagent controls only when the minimal subagent tool cannot express the task.",
 		parameters: SubagentCapabilityParams,
-		async execute(_id, params) {
+		async execute(_id: string, params: { mode: CapabilityMode }) {
 			if (params.mode === "minimal") {
 				restoreMinimalSurface();
 				return {
