@@ -52,11 +52,11 @@ When you finish implementing, run a reviewer subagent before summarizing.
 
 ### Context-efficient tool surface
 
-The default model-facing `subagent` tool intentionally exposes only ordinary one-child delegation and agent listing. The large workflow/control contract and `subagent_wait` are progressively disclosed instead of being included in every model request.
+The default model-facing `subagent` tool intentionally covers the common paths only: agent listing, one child, and ordinary parallel `calls[]`. Parallel calls are translated internally to the existing `runs.all` workflow engine, so they do not require the large workflow schema.
 
-Pi loads them automatically through the small `subagent_capability` tool when needed:
+The uncommon workflow/control contract and `subagent_wait` are progressively disclosed instead of being included in every model request. The small `subagent_capability` loader provides them only when needed:
 
-- `subagent_capability({ mode: "advanced" })` loads the full existing `subagent` workflow/control contract.
+- `subagent_capability({ mode: "advanced" })` loads the original full `subagent` workflow/control contract.
 - `subagent_capability({ mode: "wait" })` loads `subagent_wait`.
 - `subagent_capability({ mode: "all" })` loads both.
 - The minimal surface is restored after the parent turn finishes.
