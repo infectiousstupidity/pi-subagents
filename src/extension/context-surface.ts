@@ -157,13 +157,13 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 		removeActiveTool(SUBAGENT_WAIT_TOOL_NAME);
 	};
 
-	pi.registerTool({
+	const capabilityTool: ToolDefinition<typeof SubagentCapabilityParams, { mode: CapabilityMode }> = {
 		name: SUBAGENT_CAPABILITY_TOOL_NAME,
 		label: "Subagent Capability",
 		description: SUBAGENT_CAPABILITY_DESCRIPTION,
 		promptSnippet: "Load advanced subagent controls only when the minimal subagent tool cannot express the task.",
 		parameters: SubagentCapabilityParams,
-		async execute(_id: string, params: { mode: CapabilityMode }) {
+		async execute(_id, params) {
 			if (params.mode === "minimal") {
 				restoreMinimalSurface();
 				return {
@@ -205,7 +205,8 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 				details: { mode: params.mode },
 			};
 		},
-	});
+	};
+	pi.registerTool(capabilityTool);
 
 	// Advanced schemas should never become a permanent tax on later requests.
 	pi.on("session_start", restoreMinimalSurface);
