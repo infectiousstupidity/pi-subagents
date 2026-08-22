@@ -420,7 +420,33 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.isError, undefined);
 		assert.equal(result.details.mode, "workflow");
 		assert.equal(mockPi.callCount(), 1);
-		assert.match(JSON.stringify(result.details), /Converted structured single-child request/);
+		assert.doesNotMatch(result.content[0]?.text ?? "", /Console:/);
+	});
+
+	it("keeps public structured children alive when tool results backfill without execution_end", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [{ type: "tool_execution_start", toolCallId: "bash-1", toolName: "bash", args: { command: "echo PROBE_OK" } }] },
+				{ delay: 25, jsonl: [
+					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "bash-1", toolName: "bash", isError: false, content: [{ type: "text", text: "PROBE_OK" }] } },
+					events.assistantMessage("PROBE_OK"),
+				] },
+			],
+			keepAliveAfterFinalMessageMs: 400,
+		});
+		const executor = makeExecutor([makeAgent("bash-worker")]);
+
+		const result = await executor.executePublic(
+			"structured-single-tool-backfill",
+			{ agent: "bash-worker", task: "Run exactly one tool: bash with command echo PROBE_OK.", async: false, toolTimeoutMs: 100, timeoutMs: 5_000 },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		assert.match(result.content[0]?.text ?? "", /PROBE_OK/);
+		assert.equal(result.details.results[0]?.timedOut, undefined);
 	});
 
 	it("keeps public structured single-child calls foreground when async is disabled by default", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -715,8 +741,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(persistedResult.workflowReceipt?.receipt?.entries?.work?.key, "work");
 		assert.equal(persistedResult.workflowReceipt?.receipt?.entries?.work?.agent, "echo");
 		assert.equal(persistedResult.workflowReceipt?.receipt?.entries?.work?.latestRunId, persistedResult.results?.[0]?.runId);
+		assert.equal(fs.existsSync(path.join(DIRS.async, persistedResult.results?.[0]?.runId ?? "missing")), false);
 		assert.deepEqual(persistedResult.workflowReceipt?.receipt?.entries?.work?.continuation?.runIds, [persistedResult.results?.[0]?.runId]);
-		assert.equal(typeof persistedResult.workflowReceipt?.receipt?.entries?.work?.resumability?.state, "string");
+		assert.equal(persistedResult.workflowReceipt?.receipt?.entries?.work?.resumability?.state, "resumable");
 		assert.deepEqual(JSON.parse(fs.readFileSync(persistedResult.workflowReceipt!.path!, "utf-8")), persistedResult.workflowReceipt?.receipt);
 		assert.equal(fs.existsSync(path.join(DIRS.results, `${toolCallId}.json`)), false);
 		fs.rmSync(result.details.asyncDir!, { recursive: true, force: true });
@@ -2042,6 +2069,139 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(failed?.error ?? "", /first child failed/);
 		assert.equal(succeeded?.error, undefined);
 		assert.deepEqual(result.details.workflow?.trace.filter((entry) => entry.state !== "started").map(({ state }) => state).sort(), ["completed", "failed"]);
+	});
+
+	it("reports keyed runs.all result access after siblings settle", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "first child completed", matchArgIncludes: "First task" });
+		mockPi.onCall({ output: "second child completed", matchArgIncludes: "Second task" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"scripted-workflow-runs-all-keyed-result-access",
+			{
+				async: false,
+				workflowScript: `
+					const children = await runs.all([
+						{ key: "first", agent: "echo", task: "First task" },
+						{ key: "second", agent: "echo", task: "Second task" }
+					]);
+					return children.first.output;
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.equal(mockPi.callCount(), 2);
+		assert.match(result.content[0]?.text ?? "", /runs\.all resolves to an ordered array, not a key map/);
+		assert.match(result.content[0]?.text ?? "", /Use results\[0\], array destructuring, or results\.map/);
+		assert.deepEqual(result.details.workflow?.trace.filter((entry) => entry.state === "completed").map(({ key }) => key).sort(), ["first", "second"]);
+	});
+
+	it("keeps array access working when runs.all child keys collide with array properties", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "length child completed", matchArgIncludes: "Length task" });
+		mockPi.onCall({ output: "map child completed", matchArgIncludes: "Map task" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"scripted-workflow-runs-all-colliding-key-access",
+			{
+				async: false,
+				workflowScript: `
+					const children = await runs.all([
+						{ key: "length", agent: "echo", task: "Length task" },
+						{ key: "map", agent: "echo", task: "Map task" }
+					]);
+					return {
+						length: children.length,
+						first: children[0].output,
+						outputs: children.map((child) => child.output),
+						children
+					};
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		assert.equal(mockPi.callCount(), 2);
+		const value = result.details.workflow?.value as { length?: number; first?: string; outputs?: string[]; children?: Array<{ key?: string; ok?: boolean; output?: string }> } | undefined;
+		assert.equal(value?.length, 2);
+		assert.equal(value?.first, "length child completed");
+		assert.deepEqual(value?.outputs, ["length child completed", "map child completed"]);
+		assert.deepEqual(value?.children?.map(({ key, ok, output }) => ({ key, ok, output })), [
+			{ key: "length", ok: true, output: "length child completed" },
+			{ key: "map", ok: true, output: "map child completed" },
+		]);
+	});
+
+	it("emits runs.all results as plain arrays", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "first child completed", matchArgIncludes: "First task" });
+		mockPi.onCall({ output: "second child completed", matchArgIncludes: "Second task" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"scripted-workflow-runs-all-emitted-array",
+			{
+				async: false,
+				workflowScript: `
+					const children = await runs.all([
+						{ key: "first", agent: "echo", task: "First task" },
+						{ key: "second", agent: "echo", task: "Second task" }
+					]);
+					emit(children);
+					return children.map((child) => child.output);
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		assert.equal(mockPi.callCount(), 2);
+		assert.deepEqual((result.details.workflow?.emits[0] as Array<{ key: string; output: string }>).map(({ key, output }) => ({ key, output })), [
+			{ key: "first", output: "first child completed" },
+			{ key: "second", output: "second child completed" },
+		]);
+		assert.deepEqual(result.details.workflow?.value, ["first child completed", "second child completed"]);
+	});
+
+	it("keeps normal runs.all array usage working", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "first child completed", matchArgIncludes: "First task" });
+		mockPi.onCall({ output: "second child completed", matchArgIncludes: "Second task" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"scripted-workflow-runs-all-array-result-access",
+			{
+				async: false,
+				workflowScript: `
+					const children = await runs.all([
+						{ key: "first", agent: "echo", task: "First task" },
+						{ key: "second", agent: "echo", task: "Second task" }
+					]);
+					const [first, second] = children;
+					return { length: children.length, first: children[0].output, second: second.output, outputs: children.map((child) => child.output) };
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		assert.equal(mockPi.callCount(), 2);
+		assert.deepEqual(result.details.workflow?.value, {
+			length: 2,
+			first: "first child completed",
+			second: "second child completed",
+			outputs: ["first child completed", "second child completed"],
+		});
 	});
 
 	it("rejects an over-limit runs.all batch before launching any workflow child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

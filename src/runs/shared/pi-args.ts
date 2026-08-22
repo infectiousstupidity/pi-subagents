@@ -191,6 +191,7 @@ export interface BuildPiArgsInput {
 export interface BuildPiArgsResult {
 	args: string[];
 	env: Record<string, string | undefined>;
+	warnings: string[];
 	tempDir?: string;
 	toolDiagnosticPath?: string;
 	runtimeAcknowledgedExtensionsPath?: string;
@@ -251,6 +252,7 @@ export interface ResolvePiLaunchToolPlanInput {
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	agentName?: string;
+	permissionRules?: PermissionRules;
 }
 
 export interface PiLaunchToolPlan {
@@ -271,6 +273,13 @@ export interface PiLaunchToolPlan {
 	extensionArgs: string[];
 	disableAmbientExtensions: boolean;
 	capabilityAudit?: SubagentCapabilityAudit;
+	/**
+	 * Non-fatal footguns surfaced during plan resolution (currently: an agent
+	 * `extensions: []` override, which disables ALL ambient extensions for the
+	 * child rather than "adding nothing" — see the empty-extensions-override
+	 * warning below). Callers may log these; they never change behavior.
+	 */
+	warnings: string[];
 }
 
 function extensionIdentifier(value: string): string {
@@ -286,6 +295,10 @@ function boundedExtensionIdentifiers(values: string[]): {
 		ids: ids.slice(0, MAX_LAUNCH_RESOLVED_EXTENSION_IDS),
 		omitted: Math.max(0, ids.length - MAX_LAUNCH_RESOLVED_EXTENSION_IDS),
 	};
+}
+
+function hasPermissionRules(rules: PermissionRules | undefined): boolean {
+	return rules !== undefined && Object.keys(rules).length > 0;
 }
 
 export function projectLaunchResolvedChildExtensions(
@@ -451,7 +464,9 @@ export function resolvePiLaunchToolPlan(
 		: [];
 	const permSystemExt = capabilityCeiling?.denyExtensions
 		? undefined
-		: resolvePermissionSystemExtension();
+		: hasPermissionRules(input.permissionRules)
+			? resolvePermissionSystemExtension()
+			: undefined;
 	const runtimeExtensions = [
 		PROMPT_RUNTIME_EXTENSION_PATH,
 		...(fanoutAuthorized ? [FANOUT_CHILD_EXTENSION_PATH] : []),
@@ -460,6 +475,21 @@ export function resolvePiLaunchToolPlan(
 	const disableAmbientExtensions =
 		capabilityCeiling?.denyExtensions === true ||
 		input.extensions !== undefined;
+	const warnings: string[] = [];
+	// An agent override that sets `extensions: []` reads like "add nothing", but
+	// any *defined* extensions list (including an empty one) disables every
+	// ambient extension for this child — not just skips adding extras. That
+	// silently strips load-bearing ambient extensions (e.g. a model provider
+	// extension), so a provider-qualified model pin becomes unresolvable in the
+	// child with no error pointing back at the override that caused it.
+	if (capabilityCeiling?.denyExtensions !== true && Array.isArray(input.extensions) && input.extensions.length === 0) {
+		const agentLabel = input.agentName ? ` for agent '${input.agentName}'` : "";
+		warnings.push(
+			`extensions: [] override${agentLabel} disables ALL ambient extensions for this child (not just "adds nothing"), `
+				+ "including any model-provider extension needed to resolve a provider-qualified model. "
+				+ "List the extensions this child actually needs instead of an empty array.",
+		);
+	}
 	const configuredExtensions = capabilityCeiling?.denyExtensions
 		? []
 		: [
@@ -540,6 +570,7 @@ export function resolvePiLaunchToolPlan(
 		configuredExtensions,
 		extensionArgs,
 		disableAmbientExtensions,
+		warnings,
 		...(capabilityAudit ? { capabilityAudit } : {}),
 	};
 }
@@ -587,6 +618,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 			process.env[SUBAGENT_CAPABILITY_CEILING_ENV],
 		),
 		agentName: input.childAgentName,
+		permissionRules: input.permissionRules,
 	});
 	if (toolPlan.explicitToolAllowlist) {
 		args.push(
@@ -829,6 +861,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	return {
 		args,
 		env,
+		warnings: toolPlan.warnings,
 		tempDir,
 		toolDiagnosticPath,
 		runtimeAcknowledgedExtensionsPath,

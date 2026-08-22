@@ -164,6 +164,40 @@ describe("subagent prompt runtime", () => {
 		assert.equal(await askHandlers[0]!({ toolName: "write", input: { path: "out.txt" } }, { signal: undefined }), undefined);
 		assert.deepEqual(requests, [{ toolName: "write", args: { path: "out.txt" } }]);
 	});
+
+	it("fails closed when an ask permission decision stalls", async () => {
+		try {
+			process.env[PERMISSION_POLICY_ENV] = JSON.stringify({ write: "ask" });
+			process.env[CHILD_WATCHDOG_CONFIG_ENV] = JSON.stringify({
+				enabled: true,
+				watchdogTailTimeoutMs: 1_000,
+				agentEndTimeoutMs: 5,
+				maxWarnings: null,
+				lsp: { enabled: false, timeoutMs: 100, maxFiles: 1, maxDiagnostics: 1 },
+				autoFollowBlockers: false,
+				autoFollowMaxAttempts: null,
+				stalemateRepeats: 2,
+			});
+			const handlers: Array<(event: { toolName?: string; input?: unknown }, ctx: { signal?: AbortSignal }) => unknown> = [];
+			registerPermissionGate({ on(event: string, handler: (event: { toolName?: string; input?: unknown }, ctx: { signal?: AbortSignal }) => unknown) { if (event === "tool_call") handlers.push(handler); } } as never, async () => new Promise(() => undefined));
+
+			const result = await Promise.race([
+				handlers[0]!({ toolName: "write", input: { path: "out.txt" } }, { signal: undefined }),
+				new Promise((resolve) => setTimeout(() => resolve("hung"), 100)),
+			]);
+
+			assert.notEqual(result, "hung");
+			assert.deepEqual(result, {
+				block: true,
+				reason: "Blocked by pi-subagents permission rule: Watchdog permission arbiter failed closed: Watchdog permission decision timed out after 5ms.",
+			});
+		} finally {
+			if (envSnapshot.PI_SUBAGENT_PERMISSION_POLICY === undefined) delete process.env[PERMISSION_POLICY_ENV];
+			else process.env[PERMISSION_POLICY_ENV] = envSnapshot.PI_SUBAGENT_PERMISSION_POLICY;
+			if (envSnapshot.PI_SUBAGENT_WATCHDOG_CHILD_CONFIG === undefined) delete process.env[CHILD_WATCHDOG_CONFIG_ENV];
+			else process.env[CHILD_WATCHDOG_CONFIG_ENV] = envSnapshot.PI_SUBAGENT_WATCHDOG_CHILD_CONFIG;
+		}
+	});
 	it("collects runtime extension acknowledgements until terminal serialization", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-runtime-ack-"));
 		try {
@@ -634,6 +668,9 @@ describe("subagent prompt runtime", () => {
 		// Clear the ack capture env explicitly: when this test suite itself runs inside a
 		// pi-subagents child, the runner sets it and an extra agent_end handler registers.
 		delete process.env[RUNTIME_EXTENSION_ACK_PATH_ENV];
+		delete process.env[SUBAGENT_STEER_INBOX_ENV];
+		delete process.env[SUBAGENT_STEER_CAPABILITY_ENV];
+		delete process.env[SUBAGENT_STEER_ACK_DIR_ENV];
 		const handlersWithout = new Map<string, unknown[]>();
 		registerSubagentPromptRuntime({
 			on(event: string, handler: unknown) {
@@ -981,12 +1018,41 @@ describe("subagent prompt runtime", () => {
 
 			handlers.get("session_start")?.({});
 			assert.deepEqual(registered, ["subagent_wait", "contact_supervisor"]);
-			handlers.get("agent_start")?.({});
+			assert.throws(() => handlers.get("agent_start")?.({}), /requested unavailable child tools: read, grep, find, ls, bash, edit, write, intercom/);
 			assert.deepEqual(readChildToolDiagnostic(diagnosticPath), {
 				agent: "scout",
 				required: ["read", "grep", "find", "ls", "bash", "edit", "write", "intercom"],
 				available: ["subagent_wait", "contact_supervisor"],
-				missing: ["intercom"],
+				missing: ["read", "grep", "find", "ls", "bash", "edit", "write", "intercom"],
+			});
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("records missing core write tools from the actual child registry", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-core-tool-diagnostic-"));
+		try {
+			const diagnosticPath = path.join(dir, "tools.json");
+			const handlers = new Map<string, (payload?: unknown) => unknown>();
+			process.env[REQUIRED_CHILD_TOOLS_ENV] = JSON.stringify(["read", "grep", "find", "ls", "bash", "edit", "write"]);
+			process.env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV] = diagnosticPath;
+			process.env[SUBAGENT_CHILD_AGENT_ENV] = "worker";
+
+			registerSubagentPromptRuntime({
+				on(event: string, handler: (payload?: unknown) => unknown) {
+					handlers.set(event, handler);
+				},
+				getAllTools: () => ["read", "grep", "find", "ls", "contact_supervisor"].map((name) => ({ name })),
+				registerTool() {},
+			} as { on(event: string, handler: (payload?: unknown) => unknown): void; getAllTools(): Array<{ name: string }>; registerTool(): void });
+
+			assert.throws(() => handlers.get("agent_start")?.({}), /requested unavailable child tools: bash, edit, write/);
+			assert.deepEqual(readChildToolDiagnostic(diagnosticPath), {
+				agent: "worker",
+				required: ["read", "grep", "find", "ls", "bash", "edit", "write"],
+				available: ["read", "grep", "find", "ls", "contact_supervisor"],
+				missing: ["bash", "edit", "write"],
 			});
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -1065,7 +1131,7 @@ describe("subagent prompt runtime", () => {
 			assert.equal(fs.existsSync(diagnosticPath), false);
 			assert.doesNotMatch(promptRewrite?.systemPrompt ?? "", /requested unavailable child tools/);
 
-			handlers.get("agent_start")?.({});
+			assert.throws(() => handlers.get("agent_start")?.({}), /requested unavailable child tools: fixture_search/);
 			assert.deepEqual(readChildToolDiagnostic(diagnosticPath), {
 				agent: "extension-worker",
 				required: ["read", "fixture_search"],
@@ -1099,7 +1165,7 @@ describe("subagent prompt runtime", () => {
 				registerTool() {},
 			} as { on(event: string, handler: (payload?: unknown) => unknown): void; getAllTools(): Array<{ name: string }>; registerTool(): void });
 
-			assert.doesNotThrow(() => handlers.get("agent_start")?.({}));
+			assert.throws(() => handlers.get("agent_start")?.({}), /requested unavailable child tools: fixture_search/);
 			assert.deepEqual(readChildToolDiagnostic(diagnosticPath), {
 				agent: "worker",
 				required: ["read", "fixture_search"],
@@ -1129,7 +1195,7 @@ describe("subagent prompt runtime", () => {
 				registerTool() {},
 			} as { on(event: string, handler: (payload?: unknown) => unknown): void; getAllTools(): Array<{ name: string }>; registerTool(): void });
 
-			handlers.get("agent_start")?.({});
+			assert.throws(() => handlers.get("agent_start")?.({}), /requested unavailable child tools: rust_symbols_workspace_symbols, fixture_search/);
 			const diagnostic = readChildToolDiagnostic(diagnosticPath);
 			assert.deepEqual(diagnostic, {
 				agent: "worker",

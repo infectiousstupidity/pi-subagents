@@ -7,6 +7,7 @@ import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
 import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-fallback.ts";
+import { resolveModelScopesForAgent } from "../runs/shared/model-scope.ts";
 import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
@@ -14,6 +15,7 @@ import { resolveEffectiveThinking } from "../shared/model-info.ts";
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { appendTurnBudgetSystemPrompt } from "../runs/shared/turn-budget.ts";
+import { resolvePermissionRules } from "../runs/shared/permissions.ts";
 import type { ResolvedTurnBudget } from "../shared/types.ts";
 import type { ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
 import { resolveStepBehavior } from "../shared/settings.ts";
@@ -288,19 +290,21 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const externalRunner = agent.runner?.type === "external-cli" || agent.runner?.type === "external-job";
 	const availableModels = normalizeAvailableModels(input.availableModels);
 	const preferredProvider = input.preferredProvider ?? input.parentModel?.provider;
+	const modelScopes = resolveModelScopesForAgent(discovered.modelScope, agent.name, input.parentModel);
 	const primaryModel = externalRunner
 		? undefined
-		: resolveEffectiveSubagentModel(input.model, agent.model, input.parentModel, availableModels, preferredProvider, { scope: discovered.modelScope });
+		: resolveEffectiveSubagentModel(input.model, agent.model, input.parentModel, availableModels, preferredProvider, { scope: modelScopes });
 	const effectiveThinkingConfig = input.thinking !== undefined ? input.thinking : agent.thinking;
 	const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinkingConfig, input.thinking !== undefined);
 	const modelCandidates = externalRunner
 		? []
 		: buildModelCandidates(primaryModel, agent.fallbackModels, availableModels, preferredProvider, {
-			scope: discovered.modelScope,
+			scope: modelScopes,
 			primaryModelFromParent: inheritsParentModel(input.model, agent.model, input.parentModel),
 		})
 			.map((candidate) => applyThinkingSuffix(candidate, effectiveThinkingConfig, input.thinking !== undefined) ?? candidate);
 	let toolPlan: PiLaunchToolPlan;
+	const permissionRules = resolvePermissionRules(loadConfig().permissions, agent.permissions);
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
 			tools: agent.tools,
@@ -312,6 +316,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			structuredOutput: Boolean(input.outputSchema),
 			capabilityCeiling: effectiveCapabilityCeiling,
 			agentName: agent.name,
+			permissionRules,
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

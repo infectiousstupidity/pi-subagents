@@ -35,7 +35,7 @@ Add `autofix` to `/parallel-review` or `/parallel-cleanup` to apply only the syn
 
 ## Scripted workflows (workflowScript)
 
-All model-facing subagent execution is expressed through `workflowScript` in the `subagent` tool. Use stable keys and ordinary JavaScript for one child, sequence, and parallelism. For ordinary parallel fanout, use `await runs.all([{ key, agent, task }, ...])`; do not read `.output` from unawaited `runs.run` launches. Store a `runs.run` promise only when the script later observes it with `await`, `Promise.race`, or `Promise.all`, such as steering a live child before awaiting its result. Scripts are ordinary JavaScript statement bodies. Use an explicit `return` for a useful result:
+All model-facing subagent execution is expressed through `workflowScript` in the `subagent` tool. Use stable keys and ordinary JavaScript for one child, sequence, and parallelism. For ordinary parallel fanout, use `await runs.all([{ key, agent, task }, ...])`. It resolves to an ordered array, not a key map, so use indexes, destructuring, or `.map(...)`, not `results.<key>`. Do not read `.output` from unawaited `runs.run` launches. Store a `runs.run` promise only when the script later observes it with `await`, `Promise.race`, or `Promise.all`, such as steering a live child before awaiting its result. Scripts are ordinary JavaScript statement bodies. Use an explicit `return` for a useful result:
 
 Child results cross into the script as plain JSON data. Non-JSON host metadata is omitted, so use returned fields such as `runId`, `ok`, `output`, and `structuredOutput` for workflow control.
 
@@ -225,6 +225,12 @@ fresh: true
 ---
 Review $@. Return concrete findings with source proof, or state that no issue was found.
 ```
+
+For first-pass review prompts, filter by evidence rather than by severity. Ask the
+reviewer to label concrete current findings P0/P1/P2 and end with `Merge verdict:
+BLOCK`, `Merge verdict: OK`, or `Merge verdict: OK with notes`. Reserve
+`blockers only` for final pre-merge re-checks after P1/P2 findings are already
+known, or for explicit emergency hotfix lanes.
 
 ```text
 /prompt-workflow review-release-candidate v0.51.0

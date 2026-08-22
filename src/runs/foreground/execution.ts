@@ -309,6 +309,7 @@ async function runSingleAttempt(
 		originalTask?: string;
 		taskDelivery?: SubagentTaskDelivery;
 		orcaProgressTab?: OrcaProgressTab;
+		launchWarnings: { emitted: boolean };
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
@@ -327,7 +328,7 @@ async function runSingleAttempt(
 	const permissionAuditPath = permissionRules && options.artifactsDir
 		? path.join(options.artifactsDir, "permission-audit", `${options.runId}-${options.index ?? 0}.jsonl`)
 		: undefined;
-	const { args, env: sharedEnv, tempDir, toolDiagnosticPath, runtimeAcknowledgedExtensionsPath, capabilityAudit } = buildPiArgs({
+	const { args, env: sharedEnv, tempDir, toolDiagnosticPath, runtimeAcknowledgedExtensionsPath, capabilityAudit, warnings } = buildPiArgs({
 		baseArgs: ["--mode", "json", "-p"],
 		task,
 		taskDelivery: shared.taskDelivery,
@@ -370,6 +371,10 @@ async function runSingleAttempt(
 		waitToolEnabled: options.waitToolEnabled,
 		capabilityCeiling: options.capabilityCeiling,
 	});
+	if (!shared.launchWarnings.emitted && warnings.length > 0) {
+		for (const warning of warnings) console.warn(`[pi-subagents] ${warning}`);
+		shared.launchWarnings.emitted = true;
+	}
 
 	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget);
 	const toolPlan = resolvePiLaunchToolPlan({
@@ -383,6 +388,7 @@ async function runSingleAttempt(
 		capabilityCeiling: options.capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agent.name,
+		permissionRules,
 	});
 	const launchResolvedExtensions = projectLaunchResolvedChildExtensions(toolPlan);
 	const launchContractDigest = launchBindingDigest({
@@ -1052,6 +1058,20 @@ async function runSingleAttempt(
 			}
 
 			if (evt.type === "tool_result_end" && evt.message) {
+				const toolResultCompletion = {
+					toolCallId: (evt.message as { toolCallId?: unknown }).toolCallId ?? (evt as { toolCallId?: unknown }).toolCallId,
+					toolName: (evt.message as { toolName?: unknown }).toolName ?? (evt as { toolName?: unknown }).toolName,
+				};
+				clearActiveToolTimeout(toolResultCompletion);
+				const endedTool = removeActiveToolCall(toolResultCompletion);
+				if (endedTool) {
+					progress.recentTools.push({
+						tool: endedTool.tool,
+						args: endedTool.args,
+						endMs: now,
+					});
+					refreshCurrentTool();
+				}
 				result.messages!.push(evt.message);
 				const resultText = extractTextFromContent(evt.message.content);
 				if (options.toolBudget && pendingToolResult && resultText.includes("Tool budget hard limit reached")) {
@@ -1682,6 +1702,7 @@ async function runSyncCompletionInner(
 	const modelAttempts: ModelAttempt[] = [];
 	const aggregateUsage = emptyUsage();
 	const attemptNotes: string[] = [];
+	const launchWarnings = { emitted: false };
 	let totalToolCount = 0;
 	let totalDurationMs = 0;
 
@@ -1773,6 +1794,7 @@ async function runSyncCompletionInner(
 				originalTask: task,
 				taskDelivery: taskDeliveryOverride,
 				orcaProgressTab,
+				launchWarnings,
 			});
 			lastResult = result;
 			if (startupAttemptIndex === 0) {
