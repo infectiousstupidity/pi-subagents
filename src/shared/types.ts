@@ -13,6 +13,7 @@ import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from 
 import type { AuthorityPolicyConfig } from "../policy/authority.ts";
 import type { ThinkingLevel } from "./model-info.ts";
 import type { GlobalMissionIndexRecord, MissionRecord, MissionStoreConfig } from "../missions/types.ts";
+import type { ExtensionBindings } from "../runs/shared/extension-bindings.ts";
 
 // ============================================================================
 // Basic Types
@@ -348,10 +349,45 @@ export interface FileMutationEffect {
 	attempted: boolean;
 	message?: string;
 	resolvedBy?: "llm-intent-arbiter";
+	evidence?: TrackedMutationEvidence;
 }
 
 export interface EffectsProjection {
 	fileMutation?: FileMutationEffect;
+}
+
+export interface TrackedMutationSnapshot {
+	source: "tracked-files";
+	trackedOnly: true;
+	cwd: string;
+	gitRoot?: string;
+	dirtyFiles: string[];
+	fingerprints: Record<string, unknown>;
+	truncated?: boolean;
+	unavailable?: string;
+}
+
+export interface TrackedMutationEvidence {
+	source: "tracked-files";
+	trackedOnly: true;
+	changedFiles: string[];
+	attemptedMutation: boolean;
+	truncated?: boolean;
+	unavailable?: string;
+}
+
+export interface TimeoutRecoverySummary {
+	termination: "timed-out" | "stopped";
+	changedFiles: string[];
+	truncated?: boolean;
+	currentTool?: string;
+	currentToolArgs?: string;
+	currentPath?: string;
+	sessionFile?: string;
+	transcriptPath?: string;
+	artifactPaths?: ArtifactPaths;
+	warning: string;
+	message: string;
 }
 
 export const SUBAGENT_LIFECYCLE_ARTIFACT_VERSION = 3;
@@ -526,6 +562,7 @@ export interface RunFanoutRejection extends RunFanoutBudgetSnapshot {
 export interface SteeringRecoveryDescriptor {
 	version: 1;
 	launchContractDigest?: string;
+	extensionBindings?: ExtensionBindings;
 	runFanoutBudget: RunFanoutBudgetDescriptor;
 	sourceRunId: string;
 	agentContract?: AgentContract;
@@ -536,6 +573,7 @@ export interface SteeringRecoveryDescriptor {
 	modelProvider?: string;
 	modelOverrideFromParent?: boolean;
 	fallbackModels?: string[];
+	fast?: boolean;
 	thinking?: string;
 	thinkingCeiling?: ThinkingLevel;
 	tools?: string[];
@@ -941,6 +979,7 @@ export interface SingleResult {
 	context?: "fresh" | "fork";
 	exitCode: number;
 	processSignal?: string | null;
+	timeoutRecovery?: TimeoutRecoverySummary;
 	detached?: boolean;
 	detachedReason?: string;
 	interrupted?: boolean;
@@ -1505,6 +1544,7 @@ export interface AsyncStatus {
 		durationMs?: number;
 		exitCode?: number | null;
 		timedOut?: boolean;
+		timeoutRecovery?: TimeoutRecoverySummary;
 		stopped?: boolean;
 		turnBudget?: TurnBudgetState;
 		turnBudgetExceeded?: boolean;
@@ -1644,6 +1684,8 @@ export interface ForegroundResumeChild {
 	acceptance?: AcceptanceLedger;
 	agentContract?: AgentContract;
 	launchContractDigest?: string;
+	/** Private retained launch authority. Never project into status or result output. */
+	extensionBindings?: ExtensionBindings;
 	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
 	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
 	execution?: ExecutionProjection;
@@ -1944,6 +1986,8 @@ export interface RunSyncOptions {
 	nestedRoute?: NestedRouteInfo;
 	/** Override the agent's default model (format: "provider/id" or just "id") */
 	modelOverride?: string;
+	/** Opt into priority service tier for supported native OpenAI-Codex launches. */
+	fast?: boolean;
 	/** The override came from the running parent session, not configuration. */
 	modelOverrideFromParent?: boolean;
 	/** LLM intent arbiter for the completion mutation guard (rescues read-only review runs). */
@@ -1951,6 +1995,7 @@ export interface RunSyncOptions {
 	/** Override the agent's default thinking level for this run */
 	thinkingOverride?: AgentConfig["thinking"];
 	thinkingCeiling?: ThinkingLevel;
+	extensionBindings?: ExtensionBindings;
 	/** Registry models available for heuristic bare-model resolution */
 	availableModels?: Array<{ provider: string; id: string; fullId: string }>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */
@@ -1963,6 +2008,7 @@ export interface RunSyncOptions {
 		schema: JsonSchemaObject;
 		schemaPath: string;
 		outputPath: string;
+		acceptanceReportPath?: string;
 	};
 	agentContract?: AgentContract;
 	acceptance?: AcceptanceInput;

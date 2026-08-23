@@ -29,6 +29,7 @@ export interface RunnerSubagentStep {
 	structured?: boolean;
 	cwd?: string;
 	model?: string;
+	fast?: boolean;
 	thinking?: string;
 	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
 	modelCandidates?: string[];
@@ -59,12 +60,14 @@ export interface RunnerSubagentStep {
 		schema: import("../../shared/types.ts").JsonSchemaObject;
 		schemaPath: string;
 		outputPath: string;
+		acceptanceReportPath?: string;
 	};
 	structuredOutputSchema?: import("../../shared/types.ts").JsonSchemaObject;
 	agentContract?: import("../../shared/types.ts").AgentContract;
 	definitionDigest?: string;
 	launchBindingTask?: string;
 	launchContractDigest?: string;
+	extensionBindings?: import("./extension-bindings.ts").ExtensionBindings;
 	launchResolvedExtensions?: import("../../shared/types.ts").LaunchResolvedChildExtensionsV1;
 	runtimeAcknowledgedExtensions?: import("../../shared/types.ts").RuntimeAcknowledgedChildExtensionsV1;
 	effectiveAcceptance?: import("../../shared/types.ts").ResolvedAcceptanceConfig;

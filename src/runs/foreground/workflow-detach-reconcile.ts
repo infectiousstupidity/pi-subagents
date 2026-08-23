@@ -23,13 +23,16 @@ function cloneWorkflowStatus(status: AsyncStatus): AsyncStatus {
 	};
 }
 
-function childSucceeded(result: Pick<SingleResult, "exitCode" | "error">): boolean {
-	return result.exitCode === 0 && !result.error;
+function childSucceeded(result: Pick<SingleResult, "exitCode" | "error" | "interrupted">): boolean {
+	return result.exitCode === 0 && !result.error && !result.interrupted;
 }
+
+const UNSUPPORTED_DETACHED_WORKFLOW_CONTINUATION = "unsupported-continuation: detached workflow child settled, but JavaScript workflow continuation was not persisted. Resume the workflow explicitly instead of treating the completed child as top-level workflow completion.";
+const INTERRUPTED_DETACHED_CHILD = "Interrupted. Waiting for explicit next action.";
 
 export function applyDetachedChildToPausedWorkflow(
 	status: AsyncStatus,
-	input: { childRunId: string; result: Pick<SingleResult, "exitCode" | "error" | "sessionFile">; workflowKey?: string },
+	input: { childRunId: string; result: Pick<SingleResult, "exitCode" | "error" | "interrupted" | "sessionFile">; workflowKey?: string },
 ): AsyncStatus | undefined {
 	if (status.mode !== "workflow" || status.state !== "paused") return undefined;
 	const next = cloneWorkflowStatus(status);
@@ -37,6 +40,7 @@ export function applyDetachedChildToPausedWorkflow(
 		?? (input.workflowKey ? next.steps?.find((candidate) => candidate.workflowKey === input.workflowKey) : undefined);
 	if (!step) return undefined;
 	const succeeded = childSucceeded(input.result);
+	const failedSiblingError = next.steps?.find((candidate) => candidate !== step && candidate.status === "failed" && candidate.error)?.error;
 	const updatedAt = Date.now();
 	step.status = succeeded ? "completed" : "failed";
 	step.endedAt = updatedAt;
@@ -45,10 +49,12 @@ export function applyDetachedChildToPausedWorkflow(
 	delete step.currentToolStartedAt;
 	if (input.result.sessionFile) step.sessionFile = input.result.sessionFile;
 	if (succeeded) delete step.error;
+	else if (input.result.interrupted) step.error = input.result.error ?? INTERRUPTED_DETACHED_CHILD;
 	else if (input.result.error) step.error = input.result.error;
 	next.lastUpdate = updatedAt;
 	const promoted = promotePausedWorkflowIfSettled(next);
-	if (promoted?.state === "failed" && input.result.error) promoted.error = input.result.error;
+	if (promoted?.state === "failed" && input.result.interrupted && !failedSiblingError) promoted.error = input.result.error ?? INTERRUPTED_DETACHED_CHILD;
+	else if (promoted?.state === "failed" && input.result.error) promoted.error = input.result.error;
 	return promoted ?? next;
 }
 
@@ -63,10 +69,11 @@ export function promotePausedWorkflowIfSettled(status: AsyncStatus): AsyncStatus
 	const failed = next.steps.some((candidate) => candidate.status === "failed");
 	const updatedAt = Date.now();
 	next.lastUpdate = updatedAt;
-	next.state = failed ? "failed" : "complete";
+	next.state = "failed";
 	next.endedAt = updatedAt;
 	delete next.activityState;
-	if (!failed) delete next.error;
+	if (failed) return next;
+	next.error = UNSUPPORTED_DETACHED_WORKFLOW_CONTINUATION;
 	return next;
 }
 
@@ -83,6 +90,7 @@ function workflowResultChildren(status: AsyncStatus, childRunId: string, result:
 				output,
 				outputState: output.trim() ? "present" : "absent",
 				detached: undefined,
+				...(result.interrupted ? { interrupted: true } : {}),
 				...(result.error ? { error: result.error } : {}),
 			};
 		});
@@ -94,6 +102,7 @@ function workflowResultChildren(status: AsyncStatus, childRunId: string, result:
 		success: step.status === "completed" || step.status === "complete",
 		output: step.runId === childRunId ? output : "",
 		outputState: step.runId === childRunId && output.trim() ? "present" : "absent",
+		...(step.runId === childRunId && result.interrupted ? { interrupted: true } : {}),
 		...(step.error ? { error: step.error } : {}),
 	}));
 }
