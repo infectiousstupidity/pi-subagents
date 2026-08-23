@@ -58,18 +58,23 @@ function parseCsv(value: string): string[] {
 	return [...new Set(value.split(",").map((v) => v.trim()).filter(Boolean))];
 }
 
-function configObject(config: unknown): { value?: Record<string, unknown>; error?: string } {
+type ConfigObjectResult =
+	| { status: "ok"; value: Record<string, unknown> }
+	| { status: "missing" }
+	| { status: "error"; message: string };
+
+function configObject(config: unknown): ConfigObjectResult {
 	let val = config;
 	if (typeof val === "string") {
 		try {
 			val = JSON.parse(val);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			return { error: `config must be valid JSON: ${message}` };
+			return { status: "error", message: `config must be valid JSON: ${message}` };
 		}
 	}
-	if (!val || typeof val !== "object" || Array.isArray(val)) return {};
-	return { value: val as Record<string, unknown> };
+	if (!val || typeof val !== "object" || Array.isArray(val)) return { status: "missing" };
+	return { status: "ok", value: val as Record<string, unknown> };
 }
 
 function hasKey(obj: Record<string, unknown>, key: string): boolean {
@@ -177,7 +182,8 @@ function isMutableSource(source: AgentSource): source is ManagementScope {
 function modelWarning(ctx: ManagementContext, model: string | undefined): string | undefined {
 	if (!model) return undefined;
 	const found = ctx.modelRegistry.getAvailable().some((m) => `${m.provider}/${m.id}` === model || m.id === model);
-	return found ? undefined : `Warning: model '${model}' is not in the current model registry.`;
+	if (found) return undefined;
+	return `Warning: model '${model}' is not in the current model registry. Run subagent({ action: "models" }) to list valid provider/id selectors, then use the exact provider/id form (bare ids resolve only when unique).`;
 }
 
 function fallbackModelsWarning(ctx: ManagementContext, fallbackModels: string[] | undefined): string | undefined {
@@ -836,6 +842,17 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		lines.push("");
 	}
 
+	const availableFullIds = availableModels.map((m) => m.fullId).sort();
+	if (availableFullIds.length > 0) {
+		lines.push("Available models in this session's registry (copy an exact provider/id when passing model):");
+		lines.push("");
+		const shown = availableFullIds.slice(0, 80);
+		for (const fullId of shown) lines.push(`  ${fullId}`);
+		if (availableFullIds.length > shown.length) lines.push(`  ... and ${availableFullIds.length - shown.length} more`);
+		lines.push("");
+		lines.push("Use an exact provider/id from this list when you pass model; bare ids resolve only when unique in the registry.");
+	}
+
 	return result(lines.join("\n"));
 }
 
@@ -861,9 +878,9 @@ function handleGet(params: ManagementParams, ctx: ManagementContext): AgentToolR
 
 export function handleCreate(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const parsedConfig = configObject(params.config);
-	if (parsedConfig.error) return result(parsedConfig.error, true);
+	if (parsedConfig.status === "error") return result(parsedConfig.message, true);
+	if (parsedConfig.status === "missing") return result("config required for create.", true);
 	const cfg = parsedConfig.value;
-	if (!cfg) return result("config required for create.", true);
 	if (typeof cfg.name !== "string" || !cfg.name.trim()) return result("config.name is required and must be a non-empty string.", true);
 	if (typeof cfg.description !== "string" || !cfg.description.trim()) return result("config.description is required and must be a non-empty string.", true);
 	const name = sanitizeName(cfg.name);
@@ -911,9 +928,9 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 export function handleUpdate(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	if (!params.agent) return result("Specify 'agent' for update.", true);
 	const parsedConfig = configObject(params.config);
-	if (parsedConfig.error) return result(parsedConfig.error, true);
+	if (parsedConfig.status === "error") return result(parsedConfig.message, true);
+	if (parsedConfig.status === "missing") return result("config required for update.", true);
 	const cfg = parsedConfig.value;
-	if (!cfg) return result("config required for update.", true);
 	if (hasKey(cfg, "steps")) return result("Durable chain definitions were removed; use workflowScript or /prompt-workflow for repeatable workflows.", true);
 	const warnings: string[] = [];
 	const scopeHint = asDisambiguationScope(params.agentScope);

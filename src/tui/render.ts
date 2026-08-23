@@ -18,7 +18,7 @@ import {
 	type WorkflowNodeStatus,
 	type MainWindowRendererConfig,
 	MAX_WIDGET_JOBS,
-	POLL_INTERVAL_MS,
+	WIDGET_ANIMATION_INTERVAL_MS,
 	WIDGET_KEY,
 } from "../shared/types.ts";
 import { sanitizeDisplayText, truncateDisplayText } from "../shared/display-text.ts";
@@ -1580,7 +1580,7 @@ function buildWidgetComponent(jobs: AsyncJobState[], expanded: boolean): (_tui: 
 		const container = new Container();
 		container.render = (renderWidth: number): string[] => {
 			const width = Math.max(0, renderWidth - 2);
-			const frame = Math.floor(Date.now() / POLL_INTERVAL_MS);
+			const frame = Math.floor(Date.now() / WIDGET_ANIMATION_INTERVAL_MS);
 			const buildLines = (): string[] => expanded
 				? buildWidgetLines(jobs, theme, width, true, frame)
 				: jobs.length === 1
@@ -1746,8 +1746,9 @@ function workflowRowStateLabel(row: WorkflowChatProgressRow, theme: Theme): stri
 }
 
 function workflowOverallState(rows: WorkflowChatProgressRow[], hasTerminalValue: boolean, isError?: boolean): "running" | "complete" | "failed" | "paused" {
-	if (isError || rows.some((row) => row.state === "failed")) return "failed";
+	if (rows.some((row) => row.state === "failed")) return "failed";
 	if (rows.some((row) => row.state === "detached")) return "paused";
+	if (isError) return "failed";
 	if ((rows.length > 0 && rows.every((row) => row.state === "complete")) || hasTerminalValue) return "complete";
 	return "running";
 }
@@ -1948,7 +1949,7 @@ export function renderSubagentResult(
 	const layout = resolveMainWindowRenderLayout(rendererConfig);
 	const compact = (component: Component): Component => capCompactMainWindowResult(component, layout, theme, !options.expanded);
 	const d = result.details;
-	if (d?.mode === "workflow" && d.chatProgress?.mode === "live-card" && !result.isError && d.workflow?.value === undefined) {
+	if (d?.mode === "workflow" && d.chatProgress?.mode === "live-card" && d.workflow?.value === undefined && (!result.isError || (d.workflow?.trace.length ?? 0) > 0)) {
 		return compact(renderWorkflowChatProgress(d, result, theme, options.expanded ? resolveMainWindowRenderLayout() : layout, frame));
 	}
 	if (!d || !d.results.length) {

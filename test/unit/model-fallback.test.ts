@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import {
 	buildModelCandidates,
 	fuzzyResolveModel,
+	formatSubagentModelVerificationError,
 	isContextOverflow,
 	isRetryableModelFailure,
 	normalizeModelSegment,
@@ -25,6 +26,20 @@ describe("model fallback helpers", () => {
 
 	it("keeps explicit provider/model ids unchanged", () => {
 		assert.equal(resolveModelCandidate("openai/gpt-5-mini", availableModels), "openai/gpt-5-mini");
+	});
+
+	it("fails verification when the child reports an unregistered different model", () => {
+		assert.match(
+			formatSubagentModelVerificationError("openai/gpt-5-mini:high", "unknown-provider/wrong-model", availableModels) ?? "",
+			/model_verification_failed/,
+		);
+	});
+
+	it("accepts child-reported bare model ids for the expected registry entry", () => {
+		assert.equal(
+			formatSubagentModelVerificationError("openai/gpt-5-mini:high", "gpt-5-mini", availableModels),
+			undefined,
+		);
 	});
 
 	it("resolves unique owner/name ids when the owner is not a registered provider", () => {
@@ -319,6 +334,18 @@ describe("resolveEffectiveSubagentModel", () => {
 			"openai/gpt-5-mini",
 		);
 		assert.equal(warnings.length, 1);
+	});
+
+	it("uses the preferred provider for an ambiguous agent model", () => {
+		const registry = [
+			...availableModels,
+			{ provider: "gpu-b", id: "gpt-5-mini", fullId: "gpu-b/gpt-5-mini" },
+		];
+
+		assert.equal(
+			resolveEffectiveSubagentModel(undefined, "gpt-5-mini", undefined, registry, "gpu-b"),
+			"gpu-b/gpt-5-mini",
+		);
 	});
 });
 

@@ -154,6 +154,22 @@ Project prompt.
 		}
 	});
 
+	it("enforces maxThinking before a child launch and accepts levels at the ceiling", async () => {
+		const cwd = path.join(tempDir, "thinking-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeJson(path.join(cwd, ".pi", "settings.json"), { subagents: { maxThinking: "xhigh" } });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---\nname: worker\ndescription: Project worker\nmodel: test/worker\nthinking: xhigh\n---\nWorker.\n`);
+		const accepted = await resolveSubagentLaunchContract({ agent: "worker", cwd, task: "Inspect", availableModels: [{ provider: "test", id: "worker", fullId: "test/worker" }] });
+		assert.equal(accepted.ok, true);
+		if (accepted.ok) assert.equal(accepted.contract.thinkingCeiling, "xhigh");
+		const rejected = await resolveSubagentLaunchContract({ agent: "worker", cwd, task: "Inspect", thinking: "max", availableModels: [{ provider: "test", id: "worker", fullId: "test/worker" }] });
+		assert.equal(rejected.ok, false);
+		if (!rejected.ok) {
+			assert.equal(rejected.code, "thinking_ceiling");
+			assert.match(rejected.message, /max.*xhigh.*worker/);
+		}
+	});
+
 	it("binds the resolved agent outputMode into the launch digest", async () => {
 		const cwd = path.join(tempDir, "repo-output-mode");
 		fs.mkdirSync(cwd, { recursive: true });
@@ -218,6 +234,35 @@ Project prompt.
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.model, "gateway/parent-model");
 		assert.deepEqual(result.contract.modelCandidates, ["gateway/parent-model"]);
+	});
+
+	it("uses subagents.defaultProvider when resolving launch model ids", async () => {
+		const cwd = path.join(tempDir, "repo-default-provider");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeJson(path.join(process.env.HOME!, ".pi", "agent", "settings.json"), {
+			subagents: { defaultProvider: "gpu-b" },
+		});
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+model: gpt-5-mini
+---
+Project prompt.
+`);
+
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentModel: { provider: "openai", id: "gpt-5-mini" },
+			availableModels: [
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+				{ provider: "gpu-b", id: "gpt-5-mini", fullId: "gpu-b/gpt-5-mini" },
+			],
+		});
+
+		assert.equal(result.ok, true);
+		assert.equal(result.contract.model, "gpu-b/gpt-5-mini");
+		assert.deepEqual(result.contract.modelCandidates, ["gpu-b/gpt-5-mini"]);
 	});
 
 	it("bypasses native model validation for external CLI runners", async () => {

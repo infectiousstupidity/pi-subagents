@@ -55,7 +55,7 @@ import {
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, resolveToolTimeoutMs, toolTimeoutCallKey, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
-import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
+import { evaluateCompletionMutationGuard, validateImplementationToolContract } from "../shared/completion-guard.ts";
 import { arbitrateCompletionGuardRescue } from "../shared/llm-intent-arbiter.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
@@ -66,12 +66,14 @@ import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolved
 import { readRuntimeAcknowledgedExtensions } from "../shared/runtime-acknowledged-extensions.ts";
 import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
+import { assertThinkingWithinCeiling, decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV } from "../../shared/thinking-ceiling.ts";
 import { MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../shared/structured-output.ts";
 import { formatProcessSignalError, isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	buildModelCandidates,
+	formatSubagentModelVerificationError,
 	formatModelAttemptNote,
 	isContextOverflow,
 	isRetryableModelFailure,
@@ -310,10 +312,13 @@ async function runSingleAttempt(
 		taskDelivery?: SubagentTaskDelivery;
 		orcaProgressTab?: OrcaProgressTab;
 		launchWarnings: { emitted: boolean };
+		verifyModel: boolean;
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
+	assertThinkingWithinCeiling({ model: modelArg, configThinking: effectiveThinking, ceiling: options.thinkingCeiling, agent: agent.name, runId: options.runId });
+	const expectedModelForVerification = shared.verifyModel ? modelArg : undefined;
 	const resolvedThinking = resolveEffectiveThinking(modelArg, effectiveThinking);
 	const watchdogConfig = resolveWatchdogConfig(options.cwd ?? runtimeCwd);
 	const childWatchdog = watchdogConfig.ok
@@ -370,6 +375,7 @@ async function runSingleAttempt(
 		childWatchdog,
 		waitToolEnabled: options.waitToolEnabled,
 		capabilityCeiling: options.capabilityCeiling,
+		thinkingCeiling: options.thinkingCeiling,
 	});
 	if (!shared.launchWarnings.emitted && warnings.length > 0) {
 		for (const warning of warnings) console.warn(`[pi-subagents] ${warning}`);
@@ -390,6 +396,36 @@ async function runSingleAttempt(
 		agentName: agent.name,
 		permissionRules,
 	});
+	const contractTools = toolPlan.explicitToolAllowlist ? toolPlan.effectiveToolAllowlist : undefined;
+	const contractError = validateImplementationToolContract({
+		agent: agent.name,
+		task: shared.originalTask ?? task,
+		tools: contractTools,
+		mcpDirectTools: toolPlan.effectiveMcpTools,
+		configuredExtensions: toolPlan.configuredExtensions,
+		requestedTools: toolPlan.requestedBuiltinTools,
+		acceptanceRole: agent.acceptanceRole,
+		completionGuard: agent.completionGuard,
+	});
+	if (contractError) {
+		cleanupTempDir(tempDir);
+		return {
+			index: options.index ?? 0,
+			agent: agent.name,
+			task,
+			messages: [],
+			finalOutput: "",
+			exitCode: 1,
+			error: contractError,
+			usage: emptyUsage(),
+			model: modelArg,
+			modelAttempts: [],
+			attemptedModels: [],
+			progressSummary: { status: "failed", toolCount: 0, tokens: 0, durationMs: 0 },
+			...(toolPlan.capabilityCeiling ? { capabilityCeiling: toolPlan.capabilityCeiling } : {}),
+			...(toolPlan.capabilityAudit ? { capabilityAudit: toolPlan.capabilityAudit } : {}),
+		};
+	}
 	const launchResolvedExtensions = projectLaunchResolvedChildExtensions(toolPlan);
 	const launchContractDigest = launchBindingDigest({
 		definitionDigest: agentDefinitionDigest(agent),
@@ -397,6 +433,7 @@ async function runSingleAttempt(
 		...(modelArg ? { model: modelArg } : {}),
 		modelCandidates: shared.modelCandidates,
 		...(resolvedThinking ? { thinking: resolvedThinking } : {}),
+		...(options.thinkingCeiling ? { thinkingCeiling: options.thinkingCeiling } : {}),
 		systemPrompt: effectiveSystemPrompt,
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
@@ -490,6 +527,7 @@ async function runSingleAttempt(
 	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
+	let toolAvailabilityError: string | undefined;
 
 	const exitCode = await new Promise<number>((resolve) => {
 		const spawnSpec = getPiSpawnCommand(args);
@@ -1042,6 +1080,10 @@ async function runSingleAttempt(
 					if (evt.message.model) {
 						progress.model = evt.message.model;
 						if (!result.model) result.model = evt.message.model;
+						if (expectedModelForVerification && !hasToolCall) {
+							const modelVerificationError = formatSubagentModelVerificationError(expectedModelForVerification, evt.message.model, options.availableModels);
+							if (modelVerificationError && !result.error) result.error = modelVerificationError;
+						}
 					}
 					if (evt.message.errorMessage) assistantError = evt.message.errorMessage;
 					const assistantText = extractTextFromContent(evt.message.content);
@@ -1267,6 +1309,7 @@ async function runSingleAttempt(
 				// JSONL artifact flush is best effort.
 			});
 			const toolDiagnosticError = readChildToolDiagnosticError(toolDiagnosticPath);
+			toolAvailabilityError = toolDiagnosticError;
 			result.runtimeAcknowledgedExtensions = readRuntimeAcknowledgedExtensions(runtimeAcknowledgedExtensionsPath);
 			cleanupTempDir(tempDir);
 			stdoutReader.end();
@@ -1462,16 +1505,18 @@ async function runSingleAttempt(
 		fullOutput = fullOutput.trim() ? `${note}\n\n${fullOutput}` : note;
 	}
 	const completionGuardEnabled = isAgentContractV1(options.agentContract) ? agent.completionGuard === true : agent.completionGuard !== false;
-	const completionGuard = result.exitCode === 0 && !result.error && completionGuardEnabled
+	const completionGuard = ((result.exitCode === 0 && !result.error) || toolAvailabilityError) && completionGuardEnabled
 		? evaluateCompletionMutationGuard({
 			agent: agent.name,
 			task: shared.originalTask ?? task,
 			messages: result.messages ?? [],
-			tools: agent.tools,
-			mcpDirectTools: agent.mcpDirectTools,
+			tools: contractTools,
+			mcpDirectTools: toolPlan.effectiveMcpTools,
+			toolAvailabilityError,
 		})
 		: undefined;
 	let completionGuardTriggered = completionGuard?.triggered === true && !observedMutationAttempt;
+	const completionGuardBlocked = completionGuard?.blocked === true;
 	// The classifier is deliberately narrow, so a read-only review task can
 	// still be misread as implementation. Arbitrate BEFORE any failure side
 	// effect is published (effects, exit code, progress, notifications,
@@ -1492,7 +1537,9 @@ async function runSingleAttempt(
 		result.effects = {
 			...(result.effects ?? {}),
 			fileMutation: {
-				status: completionGuard.expectedMutation
+				status: completionGuardBlocked
+					? "blocked"
+					: completionGuard.expectedMutation
 					? completionGuardTriggered
 						? "missing"
 						: arbiterRescued
@@ -1500,7 +1547,8 @@ async function runSingleAttempt(
 							: "observed"
 					: "not-applicable",
 				expected: completionGuard.expectedMutation,
-				attempted: completionGuard.attemptedMutation || observedMutationAttempt,
+				attempted: completionGuardBlocked ? false : completionGuard.attemptedMutation || observedMutationAttempt,
+				...(completionGuardBlocked && completionGuard.message ? { message: completionGuard.message } : {}),
 				...(completionGuardTriggered ? { message: "Subagent completed without making edits for an implementation task." } : {}),
 				...(arbiterRescued ? { resolvedBy: "llm-intent-arbiter" } : {}),
 			},
@@ -1582,6 +1630,14 @@ async function runSyncCompletionInner(
 			error: `Unknown agent: ${agentName}`,
 		}, options.context));
 	}
+	options = {
+		...options,
+		thinkingCeiling: intersectThinkingCeilings(
+			options.thinkingCeiling,
+			agent.maxThinking,
+			decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
+		),
+	};
 	try {
 		assertAgentAllowedByCapabilityCeiling(agent.name, options.capabilityCeiling);
 	} catch (error) {
@@ -1695,9 +1751,25 @@ async function runSyncCompletionInner(
 		options.modelOverride ?? agent.model,
 		agent.fallbackModels,
 		options.availableModels,
-		options.preferredModelProvider,
+		agent.modelProvider ?? options.preferredModelProvider,
 		{ scope: options.modelScope, primaryModelFromParent: options.modelOverrideFromParent },
 	);
+	try {
+		for (const candidate of candidates) {
+			const model = applyThinkingSuffix(candidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined);
+			assertThinkingWithinCeiling({ model, configThinking: options.thinkingOverride ?? agent.thinking, ceiling: options.thinkingCeiling, agent: agent.name, runId: options.runId });
+		}
+	} catch (error) {
+		return redactResultPrompt(withRunContext({
+			index: options.index ?? 0,
+			agent: agent.name,
+			task,
+			exitCode: 1,
+			messages: [],
+			usage: emptyUsage(),
+			error: error instanceof Error ? error.message : String(error),
+		}, options.context));
+	}
 	const attemptedModels: string[] = [];
 	const modelAttempts: ModelAttempt[] = [];
 	const aggregateUsage = emptyUsage();
@@ -1777,6 +1849,7 @@ async function runSyncCompletionInner(
 	modelAttemptsLoop: for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
 		const candidate = modelsToTry[modelIndex];
 		for (let startupAttemptIndex = 0; ; startupAttemptIndex++) {
+			const verifyModel = Boolean(candidate) && !(options.modelOverrideFromParent && modelIndex === 0);
 			const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
 			const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, attemptOptions, {
 				sessionEnabled,
@@ -1795,6 +1868,7 @@ async function runSyncCompletionInner(
 				taskDelivery: taskDeliveryOverride,
 				orcaProgressTab,
 				launchWarnings,
+				verifyModel,
 			});
 			lastResult = result;
 			if (startupAttemptIndex === 0) {

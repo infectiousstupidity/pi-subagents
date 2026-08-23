@@ -1,19 +1,40 @@
 # Changelog
 
-## [Unreleased]
+## [0.55.0] - 2026-08-23
+
+### Highlights
+- Stop a single stuck child in an async workflow without stopping the whole run.
+- Continue finished external jobs, like `gpt-pro` from [Surf](https://github.com/nicobailon/surf-cli/), with follow-up requests through `resume`.
+- Cap child thinking with `subagents.maxThinking` and set a preferred default provider for bare model ids.
+- Scripted workflow outputs now land in the run's managed artifact directory instead of the repository root.
+- Child launches fail fast with clear reasons when requested models or write tools are unavailable.
 
 ### Added
-- Let `agentOverrides` set or clear default `output` paths and `defaultReads`, while
-  preserving explicit custom-agent frontmatter and preventing settings-derived values
-  from being serialized into custom definitions. Thanks to [@mevatron](https://github.com/mevatron) for #1349.
-- Add delegated review guidance that separates evidence requirements from
-  severity labels so first-pass reviews do not default to `blockers only`.
+- Add `subagents.maxThinking` to enforce a thinking ceiling across native subagent launches. Thanks to [@alex-real14](https://github.com/alex-real14) for #1397.
+- Add `subagents.defaultProvider` and per-agent `defaultProvider` overrides so bare subagent model ids can prefer a configured provider. Thanks to [@swingtempo](https://github.com/swingtempo) for #1393.
+- Add external-job follow-ups through `subagent({ action: "resume" })` for completed provider jobs that expose `followUp(input)`, with duplicate request dedupe, durable parent-job lineage (#1381), and clearer errors when a follow-up cannot start.
+- Add child-scoped stop support and child stop observer events for async/workflow runs. Malformed child stop requests are rejected instead of widening to a run-level stop. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1367.
+- Create one passive Orca observer tab per top-level subagent call, with shared chain/parallel progress and project-local observer manifests. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #1360.
+- Count Herdr project panes in inline status and report compact Herdr pane title suffixes for active subagent work.
+- Let `agentOverrides` set or clear default `output` paths and `defaultReads`, while preserving explicit custom-agent frontmatter and preventing settings-derived values from being serialized into custom definitions. Thanks to [@mevatron](https://github.com/mevatron) for #1349.
+- Surface copyable `provider/id` model selectors from `{ action: "models" }` and point invalid model warnings at that discovery path. Thanks to [@lixinglong27](https://github.com/lixinglong27) for #1365.
+- Add bundled skill guidance for lightweight task profiles before subagent fanout. Thanks to [@srcKod](https://github.com/srcKod) for #1395.
+- Add delegated review guidance that separates evidence requirements from severity labels so first-pass reviews do not default to `blockers only`.
 
 ### Fixed
-- Report helpful workflow errors when `runs.all(...)` results are read as keyed
-  objects instead of ordered arrays. Thanks to [@ravshansbox](https://github.com/ravshansbox) for #1351.
-- Fail child launch attempts when the runtime lacks requested core write tools,
-  instead of letting implementation workers continue as read-only runs.
+- Route relative `workflowScript` output paths through managed artifacts instead of creating report files in the repository root.
+- Keep the async widget spinner and elapsed timer moving while the parent is idle by routing animation ticks through the live widget rebuild path. Thanks to [@0xFlo](https://github.com/0xFlo) for #1390.
+- Slow async widget animation rerenders to 1 Hz so quiet running jobs do not repaint the full TUI at the liveness tick rate. Thanks to [@0xFlo](https://github.com/0xFlo) for #1376.
+- Fail a Pi child launch when the child reports a different provider/model than the resolved requested model. Thanks to [@zzzubair](https://github.com/zzzubair) for #1377.
+- Render detached workflow supervisor handoffs as paused/waiting and include workflow and child run ids in completion notifications.
+- Report implementation runs blocked by missing child tools as blocked mutation effects instead of no-edit completion guard failures.
+- Fail child launch attempts when the runtime lacks requested core write tools or an implementation worker has only read-only launch tools, including workflow children that inherit a read-only capability ceiling.
+- Let read-only reviewer acceptance rely on the parent-side staged-file check instead of requiring child-reported `noStagedFiles` evidence.
+- Run public single-child launches directly instead of wrapping them in a workflow, so async external-job agents do not show a completed workflow before the real provider job finishes.
+- Start omitted-`async` public external-runner single-child launches in the supported background mode, so package agents such as `gpt-pro` from [Surf](https://github.com/nicobailon/surf-cli/) do not fail as foreground requests.
+- Let workflow scripts await omitted-`async` external-runner children by launching them in the background internally and returning their terminal result.
+- Report helpful workflow errors when `runs.all(...)` results are read as keyed objects instead of ordered arrays. Thanks to [@ravshansbox](https://github.com/ravshansbox) for #1351.
+- Clarify that Council Mode can include installed external-runner advisors such as `gpt-pro` from [Surf](https://github.com/nicobailon/surf-cli/) when the `surf-cli` Pi extension has registered `surf-oracle`, with text JSON reports instead of `outputSchema`.
 
 ## [0.54.0] - 2026-08-21
 

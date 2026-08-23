@@ -11,6 +11,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ModelScopeRule } from "../runs/shared/model-scope.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import type { AuthorityPolicyConfig } from "../policy/authority.ts";
+import type { ThinkingLevel } from "./model-info.ts";
 import type { GlobalMissionIndexRecord, MissionRecord, MissionStoreConfig } from "../missions/types.ts";
 
 // ============================================================================
@@ -342,7 +343,7 @@ export interface ReviewProjection {
 }
 
 export interface FileMutationEffect {
-	status: "not-requested" | "not-applicable" | "observed" | "missing";
+	status: "not-requested" | "not-applicable" | "observed" | "missing" | "blocked";
 	expected: boolean;
 	attempted: boolean;
 	message?: string;
@@ -532,9 +533,11 @@ export interface SteeringRecoveryDescriptor {
 	sessionFile?: string;
 	cwd: string;
 	model?: string;
+	modelProvider?: string;
 	modelOverrideFromParent?: boolean;
 	fallbackModels?: string[];
 	thinking?: string;
+	thinkingCeiling?: ThinkingLevel;
 	tools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
@@ -1372,6 +1375,12 @@ export interface ExternalJobStatus {
 	provider: string;
 	providerJobId?: string;
 	promptDigest: string;
+	operation?: "start" | "follow-up";
+	sourceRunId?: string;
+	sourceStepIndex?: number;
+	parentProviderJobId?: string;
+	requestId?: string;
+	requestDigest?: string;
 	options: Record<string, unknown>;
 	handleUrl?: string;
 	conversationUrl?: string;
@@ -1454,6 +1463,8 @@ export interface AsyncStatus {
 	/** Set when a durable schedule launched this run, so completions can name their origin. */
 	scheduleOrigin?: ScheduleOrigin;
 	steps?: Array<{
+		/** Stable caller-facing child identity for inspect/status/stop. */
+		childId?: string;
 		agent: string;
 		runner?: ExternalCliRunnerStatus | ExternalJobRunnerStatus;
 		externalProcess?: ExternalProcessStatus;
@@ -1473,6 +1484,8 @@ export interface AsyncStatus {
 		outputName?: string;
 		structured?: boolean;
 		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "stopped" | "rejected";
+		stopRequested?: boolean;
+		stopRequestedAt?: number;
 		children?: NestedRunSummary[];
 		sessionFile?: string;
 		transcriptPath?: string;
@@ -1502,6 +1515,7 @@ export interface AsyncStatus {
 		skills?: string[];
 		model?: string;
 		thinking?: string;
+		thinkingCeiling?: ThinkingLevel;
 		attemptedModels?: string[];
 		modelAttempts?: ModelAttempt[];
 		/** True when the child input exceeded the model context window. */
@@ -1764,6 +1778,8 @@ export interface SubagentState {
 	};
 	/** Current-session top-level async capacity projection. */
 	activeAsyncCapacity?: ActiveAsyncCapacitySnapshot;
+	/** Herdr project panes opened by this Pi session, keyed by project root. */
+	herdrProjectPanes?: Map<string, HerdrProjectPaneSnapshot>;
 	asyncJobs: Map<string, AsyncJobState>;
 	/** Current-session active and recent async runs for the native fleet inspector. */
 	fleetJobs?: Map<string, AsyncJobState>;
@@ -1790,6 +1806,26 @@ export interface SubagentState {
 	waitSubscriptions?: Map<string, WaitSubscriptionRecord>;
 	/** Live in-process workflow controllers. Durable status remains on disk after settlement. */
 	workflowControllers?: Map<string, AbortController>;
+	/** Live in-process workflow child stoppers keyed by parent workflow run id. */
+	workflowChildStops?: Map<string, (childId: string, message?: string) => boolean>;
+}
+
+export interface HerdrProjectPaneSnapshot {
+	projectRoot: string;
+	bindingPath: string;
+	paneId: string;
+	openedAt: string;
+	lastFocusedAt?: string;
+	state: "open" | "stale";
+	agentStatus: string;
+	ownership: "verified" | "unknown" | "mismatch";
+	safeToClose: boolean;
+	refreshedAt: number;
+	summary?: string;
+	tabId?: string;
+	workspaceId?: string;
+	terminalTitle?: string;
+	staleReason?: string;
 }
 
 // ============================================================================
@@ -1825,8 +1861,27 @@ export const SUBAGENT_FOREGROUND_COMPLETE_EVENT = "subagent:foreground-complete"
 export const SUBAGENT_CONTROL_EVENT = "subagent:control-event";
 export const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 export const SUBAGENT_STEERING_NOTICE_EVENT = "subagent:steering-notice";
+export const SUBAGENT_CHILD_STATUS_EVENT = "subagent:child-status";
 export const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
 export const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
+
+export interface SubagentChildStatusEvent {
+	type: "subagent.child-status";
+	version: 1;
+	runId: string;
+	childId: string;
+	status: "stopping" | "stopped";
+	ts: number;
+	reason?: string;
+	source?: "rpc" | "async";
+	asyncDir?: string;
+	stepIndex?: number;
+	agent?: string;
+	childRunId?: string;
+	workflowKey?: string;
+	phase?: string;
+	label?: string;
+}
 
 // ============================================================================
 // Execution Options
@@ -1895,6 +1950,7 @@ export interface RunSyncOptions {
 	llmIntentArbiter?: import("../runs/shared/llm-intent-arbiter.ts").TaskMutationArbiter;
 	/** Override the agent's default thinking level for this run */
 	thinkingOverride?: AgentConfig["thinking"];
+	thinkingCeiling?: ThinkingLevel;
 	/** Registry models available for heuristic bare-model resolution */
 	availableModels?: Array<{ provider: string; id: string; fullId: string }>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */
@@ -1982,7 +2038,7 @@ export type FleetKeybindingAction = typeof FLEET_KEYBINDING_ACTIONS[number];
 export type FleetKeybindingsConfig = Partial<Record<FleetKeybindingAction, string[]>>;
 
 export interface OrcaProgressTabsConfig {
-	/** Create one Orca terminal tab per running subagent. Experimental and opt-in. */
+	/** Create one Orca observer tab per top-level subagent call. Experimental and opt-in. */
 	enabled?: boolean;
 }
 
@@ -2178,6 +2234,7 @@ export const SLASH_SUBAGENT_RESPONSE_EVENT = "subagent:slash:response";
 export const SLASH_SUBAGENT_UPDATE_EVENT = "subagent:slash:update";
 export const SLASH_SUBAGENT_CANCEL_EVENT = "subagent:slash:cancel";
 export const POLL_INTERVAL_MS = 250;
+export const WIDGET_ANIMATION_INTERVAL_MS = 1000;
 export const MAX_WIDGET_JOBS = 4;
 export const DEFAULT_SUBAGENT_MAX_DEPTH = 2;
 export const SUBAGENT_ACTIONS = ["list", "get", "models", "children.list", "guide", "create", "update", "delete", "eject", "disable", "enable", "reset", "mission.create", "mission.list", "mission.show", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "worktree.discard", "refine", "refine.show", "refine.rollback", "inspector.open", "inspector.status", "inspector.close", "project.open", "project.status", "project.close", "status", "debug.run", "grant-spawn-budget", "interrupt", "resume", "steer", "stop", "dismiss", "doctor", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "schedule.create", "schedule.list", "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"] as const;

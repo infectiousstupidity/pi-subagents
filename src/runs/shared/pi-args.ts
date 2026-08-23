@@ -26,6 +26,7 @@ import {
 	type RunFanoutBudgetDescriptor,
 } from "../../shared/types.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
+import { decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV } from "../../shared/thinking-ceiling.ts";
 import { encodeRunFanoutBudgetDescriptor, RUN_FANOUT_BUDGET_ENV } from "./run-fanout-budget.ts";
 import {
 	TOOL_BUDGET_ENV,
@@ -186,6 +187,7 @@ export interface BuildPiArgsInput {
 	taskDelivery?: SubagentTaskDelivery;
 	waitToolEnabled?: boolean;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
 }
 
 export interface BuildPiArgsResult {
@@ -273,12 +275,7 @@ export interface PiLaunchToolPlan {
 	extensionArgs: string[];
 	disableAmbientExtensions: boolean;
 	capabilityAudit?: SubagentCapabilityAudit;
-	/**
-	 * Non-fatal footguns surfaced during plan resolution (currently: an agent
-	 * `extensions: []` override, which disables ALL ambient extensions for the
-	 * child rather than "adding nothing" — see the empty-extensions-override
-	 * warning below). Callers may log these; they never change behavior.
-	 */
+	/** Non-fatal launch warnings; they do not change behavior. */
 	warnings: string[];
 }
 
@@ -476,12 +473,7 @@ export function resolvePiLaunchToolPlan(
 		capabilityCeiling?.denyExtensions === true ||
 		input.extensions !== undefined;
 	const warnings: string[] = [];
-	// An agent override that sets `extensions: []` reads like "add nothing", but
-	// any *defined* extensions list (including an empty one) disables every
-	// ambient extension for this child — not just skips adding extras. That
-	// silently strips load-bearing ambient extensions (e.g. a model provider
-	// extension), so a provider-qualified model pin becomes unresolvable in the
-	// child with no error pointing back at the override that caused it.
+	// An explicit empty list disables ambient extensions, including model providers.
 	if (capabilityCeiling?.denyExtensions !== true && Array.isArray(input.extensions) && input.extensions.length === 0) {
 		const agentLabel = input.agentName ? ` for agent '${input.agentName}'` : "";
 		warnings.push(
@@ -834,6 +826,11 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	const encodedCapabilityCeiling = encodeSubagentCapabilityCeiling(
 		toolPlan.capabilityCeiling,
 	);
+	const thinkingCeiling = intersectThinkingCeilings(
+		input.thinkingCeiling,
+		decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
+	);
+	if (thinkingCeiling) env[SUBAGENT_THINKING_CEILING_ENV] = thinkingCeiling;
 	if (encodedCapabilityCeiling)
 		env[SUBAGENT_CAPABILITY_CEILING_ENV] = encodedCapabilityCeiling;
 	if (encodedPermissionRules)
