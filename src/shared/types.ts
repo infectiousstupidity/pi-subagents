@@ -85,6 +85,7 @@ export type WorkflowReceiptEntry = WorkflowReceiptEntryResumability & {
 	requestedContext?: "fresh" | "fork";
 	resolvedContext?: "fresh" | "fork" | "mixed";
 	outputReference?: string;
+	externalAdapter?: ExternalCliReceiptMetadata;
 	continuation: { runIds: string[] };
 };
 
@@ -362,10 +363,12 @@ export interface TrackedMutationSnapshot {
 	cwd: string;
 	gitRoot?: string;
 	dirtyFiles: string[];
-	fingerprints: Record<string, unknown>;
+	fingerprints: Record<string, TrackedMutationFingerprint>;
 	truncated?: boolean;
 	unavailable?: string;
 }
+
+export type TrackedMutationFingerprint = { kind: "diff"; digest: string };
 
 export interface TrackedMutationEvidence {
 	source: "tracked-files";
@@ -1042,6 +1045,8 @@ export interface SingleResult {
 	watchdog?: ChildWatchdogProgress;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
+	runner?: ExternalCliRunnerStatus | ExternalJobRunnerStatus;
+	externalProcess?: ExternalProcessStatus;
 }
 
 export interface SpawnBudgetGrant {
@@ -1373,9 +1378,11 @@ export type AgentRunnerConfig =
 	| { type: "pi" }
 	| {
 		type: "external-cli";
+		adapter?: "codex-exec";
 		command: string;
 		args?: string[];
 		promptDelivery?: "stdin";
+		capabilities?: ExternalCliCapabilityNarrowing;
 	}
 	| {
 		type: "external-job";
@@ -1383,18 +1390,39 @@ export type AgentRunnerConfig =
 		options?: Record<string, unknown>;
 	};
 
+export type ExternalCliCapabilityNarrowing = Partial<Record<"steer" | "resume" | "structuredOutput" | "toolEvents" | "supervisor" | "forkContext" | "extensionBindings", false>>;
+
+export interface ExternalCliCapabilities {
+	stop: true;
+	steer: false;
+	resume: false;
+	structuredOutput: false;
+	toolEvents: false;
+	supervisor: "unsupported";
+	forkContext: false;
+	extensionBindings: false;
+}
+
+export interface ExternalCliReceiptMetadata {
+	adapter: { id: "external-cli" | "codex-exec"; version: 1; executionMode: "one-shot-stdin" };
+	capabilities: ExternalCliCapabilities;
+	safety?: { sandbox: "read-only"; approvalPolicy: "never"; ephemeral: true };
+	outputArtifacts?: { stdoutPath?: string; stderrPath?: string; finalOutputPath?: string };
+	handoff: { mode: "fresh" };
+	supervisor: { mode: "unsupported"; reason: string };
+	nonResumableReason: string;
+}
+
 export interface ExternalCliRunnerStatus {
 	type: "external-cli";
 	command: string;
 	args: string[];
 	promptDelivery: "stdin";
-	capabilities: {
-		stop: true;
-		steer: false;
-		resume: false;
-		structuredOutput: false;
-		toolEvents: false;
-	};
+	adapter: ExternalCliReceiptMetadata["adapter"];
+	safety?: ExternalCliReceiptMetadata["safety"];
+	capabilities: ExternalCliCapabilities;
+	unsupportedReasons: Record<Exclude<keyof ExternalCliCapabilities, "stop">, string>;
+	nonResumableReason: string;
 }
 
 export interface ExternalJobRunnerStatus {
@@ -1441,6 +1469,11 @@ export interface ExternalProcessStatus {
 	processSignal?: string | null;
 	stdoutPath: string;
 	stderrPath: string;
+	finalOutputPath?: string;
+	stdoutBytes?: number;
+	stderrBytes?: number;
+	stdoutTruncated?: boolean;
+	stderrTruncated?: boolean;
 }
 
 export interface AsyncStatus {

@@ -144,6 +144,8 @@ import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, PI_AGGREGATE_EVENT_PROJECTOR, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
 import { buildExternalCliPrompt, runExternalCli } from "../shared/external-cli-runner.ts";
+import { resolveCodexExecLaunch } from "../shared/codex-exec-adapter.ts";
+import { resolveExternalCliRunnerStatus } from "../shared/external-cli-contract.ts";
 import { runExternalJob } from "../shared/external-job-runner.ts";
 import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
 import { decodeSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -1381,21 +1383,22 @@ async function runSingleStepInner(
 	transcriptWriter?.writeInitialUserMessage(`${PROMPT_REDACTED}; live Prompt Audit only.`);
 
 	if (step.runner?.type === "external-cli") {
-		const runner: ExternalCliRunnerStatus = {
-			type: "external-cli",
-			command: step.runner.command,
-			args: step.runner.args ?? [],
-			promptDelivery: step.runner.promptDelivery ?? "stdin",
-			capabilities: { stop: true, steer: false, resume: false, structuredOutput: false, toolEvents: false },
-		};
+		const adapterLaunch = step.runner.adapter === "codex-exec"
+			? resolveCodexExecLaunch({ command: step.runner.command, asyncDir: path.dirname(ctx.outputFile), stepIndex: ctx.flatIndex })
+			: undefined;
+		const runner = resolveExternalCliRunnerStatus({ ...step.runner, ...(adapterLaunch ? { args: adapterLaunch.args } : {}) });
 		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 		const external = await runExternalCli(omitUndefinedProperties({
-			command: runner.command,
-			args: runner.args,
+			command: adapterLaunch?.command ?? runner.command,
+			args: adapterLaunch?.args ?? runner.args,
 			cwd: step.cwd ?? ctx.cwd,
 			prompt: buildExternalCliPrompt(step.systemPrompt ?? "", task),
 			asyncDir: path.dirname(ctx.outputFile),
 			stepIndex: ctx.flatIndex,
+			environment: adapterLaunch?.environment,
+			preflight: adapterLaunch?.preflight,
+			parser: adapterLaunch?.parser,
+			finalOutputPath: adapterLaunch?.finalOutputPath,
 			registerTimeout: ctx.registerTimeout,
 			registerStop: ctx.registerStop,
 			timeoutMessage: ctx.timeoutMessage,
@@ -1645,6 +1648,7 @@ async function runSingleStepInner(
 				task: step.launchBindingTask ?? task,
 				...(candidate ? { model: candidate } : {}),
 				modelCandidates: candidates as string[],
+				...(step.fast !== undefined ? { fast: step.fast } : {}),
 				...(resolveEffectiveThinking(candidate, step.thinking) ? { thinking: resolveEffectiveThinking(candidate, step.thinking) } : {}),
 				...(step.thinkingCeiling ? { thinkingCeiling: step.thinkingCeiling } : {}),
 				systemPrompt: appendTurnBudgetSystemPrompt(step.systemPrompt ?? "", ctx.turnBudget),
@@ -2097,13 +2101,7 @@ type RunnerStatusStep = NonNullable<AsyncStatus["steps"]>[number] & {
 
 function externalRunnerStatus(runner: SubagentStep["runner"]): ExternalCliRunnerStatus | ExternalJobRunnerStatus | undefined {
 	if (runner?.type === "external-cli") {
-		return {
-			type: "external-cli",
-			command: runner.command,
-			args: runner.args ?? [],
-			promptDelivery: runner.promptDelivery ?? "stdin",
-			capabilities: { stop: true, steer: false, resume: false, structuredOutput: false, toolEvents: false },
-		};
+		return resolveExternalCliRunnerStatus(runner);
 	}
 	if (runner?.type === "external-job") {
 		return {
