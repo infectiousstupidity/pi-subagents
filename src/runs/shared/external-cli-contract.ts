@@ -16,6 +16,32 @@ const UNSUPPORTED = {
 } as const;
 
 const CAPABILITY_KEYS = new Set(Object.keys(UNSUPPORTED));
+const PROMPT_FILE_UNSUPPORTED = {
+	...UNSUPPORTED,
+	steer: "The one-shot prompt-file adapter closes input after launch and cannot accept live steer messages.",
+	resume: "The one-shot prompt-file adapter does not retain a durable external session identity.",
+} as const;
+
+export function validateCodeOwnedProfileRunner(
+	agent: {
+		name: string;
+		localName?: string;
+		aliases?: readonly string[];
+		runner?: { type: string; adapter?: string };
+	},
+): string | undefined {
+	const selectionNames = [agent.name, ...(agent.localName ? [agent.localName] : []), ...(agent.aliases ?? [])];
+	if (selectionNames.includes("claude-code") && !(agent.runner?.type === "external-cli" && agent.runner.adapter === "claude-code")) {
+		return "Selection name 'claude-code' is reserved for the read-only 'claude-code' adapter. Use 'claude-code-writer' for explicit file-write access.";
+	}
+	if (selectionNames.includes("codex-exec") && !(agent.runner?.type === "external-cli" && agent.runner.adapter === "codex-exec")) {
+		return "Selection name 'codex-exec' is reserved for the read-only 'codex-exec' adapter. Use 'codex-exec-writer' for explicit workspace-write access.";
+	}
+	if (selectionNames.includes("cursor-agent") && !(agent.runner?.type === "external-cli" && agent.runner.adapter === "cursor-agent")) {
+		return "Selection name 'cursor-agent' is reserved for the read-only 'cursor-agent' adapter. Use 'cursor-agent-writer' for explicit workspace-write access.";
+	}
+	return undefined;
+}
 
 export function parseExternalCliCapabilityNarrowing(value: unknown, label: string): ExternalCliCapabilityNarrowing | undefined {
 	if (value === undefined) return undefined;
@@ -30,20 +56,32 @@ export function parseExternalCliCapabilityNarrowing(value: unknown, label: strin
 }
 
 export function resolveExternalCliRunnerStatus(input: {
-	adapter?: "codex-exec";
+	adapter?: "codex-exec" | "codex-exec-writer" | "claude-code" | "claude-code-writer" | "cursor-agent" | "cursor-agent-writer";
 	command: string;
 	args?: string[];
 	promptDelivery?: "stdin";
 	capabilities?: ExternalCliCapabilityNarrowing;
 }): ExternalCliRunnerStatus {
 	const codexExec = input.adapter === "codex-exec";
+	const codexExecWriter = input.adapter === "codex-exec-writer";
+	const claudeCode = input.adapter === "claude-code";
+	const claudeCodeWriter = input.adapter === "claude-code-writer";
+	const cursorAgent = input.adapter === "cursor-agent";
+	const cursorAgentWriter = input.adapter === "cursor-agent-writer";
+	const cursor = cursorAgent || cursorAgentWriter;
+	const unsupported = cursor ? PROMPT_FILE_UNSUPPORTED : UNSUPPORTED;
 	return {
 		type: "external-cli",
 		command: input.command,
 		args: input.args ?? [],
-		promptDelivery: input.promptDelivery ?? "stdin",
-		adapter: { id: codexExec ? "codex-exec" : "external-cli", version: 1, executionMode: "one-shot-stdin" },
+		promptDelivery: cursor ? "prompt-file" : input.promptDelivery ?? "stdin",
+		adapter: { id: input.adapter ?? "external-cli", version: 1, executionMode: cursor ? "one-shot-prompt-file" : "one-shot-stdin" },
 		...(codexExec ? { safety: { sandbox: "read-only" as const, approvalPolicy: "never" as const, ephemeral: true as const } } : {}),
+		...(codexExecWriter ? { safety: { access: "workspace-write" as const, sandbox: "workspace-write" as const, approvalPolicy: "never" as const, ephemeral: true as const } } : {}),
+		...(claudeCode ? { safety: { access: "read-only" as const, authentication: "existing-cli-required" as const, permissionMode: "plan" as const, tools: "none" as const, mcp: "empty-strict" as const, settingSources: "user" as const, userSettingsTrust: "required" as const, sessionPersistence: false as const } } : {}),
+		...(claudeCodeWriter ? { safety: { access: "workspace-write" as const, authentication: "existing-cli-required" as const, permissionMode: "acceptEdits" as const, tools: "Read,Write,Edit,Glob,Grep" as const, mcp: "empty-strict" as const, settingSources: "user" as const, userSettingsTrust: "required" as const, sessionPersistence: false as const } } : {}),
+		...(cursorAgent ? { safety: { access: "read-only" as const, authentication: "cursor-api-key-or-existing-login" as const, mode: "ask" as const, sandbox: "enabled" as const, workspaceTrust: "existing-required" as const, sessionReuse: false as const } } : {}),
+		...(cursorAgentWriter ? { safety: { access: "workspace-write" as const, authentication: "cursor-api-key-or-existing-login" as const, mode: "print" as const, sandbox: "enabled" as const, workspaceTrust: "existing-required" as const, sessionReuse: false as const } } : {}),
 		capabilities: {
 			stop: true,
 			steer: false,
@@ -54,8 +92,8 @@ export function resolveExternalCliRunnerStatus(input: {
 			forkContext: false,
 			extensionBindings: false,
 		},
-		unsupportedReasons: UNSUPPORTED,
-		nonResumableReason: UNSUPPORTED.resume,
+		unsupportedReasons: unsupported,
+		nonResumableReason: unsupported.resume,
 	};
 }
 
@@ -67,9 +105,22 @@ export function normalizeExternalCliRunnerStatus(value: unknown): ExternalCliRun
 		? input.args
 		: undefined;
 	const promptDelivery = input.promptDelivery === "stdin" ? "stdin" : undefined;
-	const adapter = input.adapter && typeof input.adapter === "object" && !Array.isArray(input.adapter) && (input.adapter as Record<string, unknown>).id === "codex-exec"
-		? "codex-exec" as const
+	const adapterId = input.adapter && typeof input.adapter === "object" && !Array.isArray(input.adapter)
+		? (input.adapter as Record<string, unknown>).id
 		: undefined;
+	if (adapterId === "grok-build") {
+		return {
+			type: "external-cli",
+			command: input.command,
+			args: args ?? [],
+			promptDelivery: "prompt-file",
+			adapter: { id: "grok-build", version: 1, executionMode: "one-shot-prompt-file" },
+			capabilities: { stop: true, steer: false, resume: false, structuredOutput: false, toolEvents: false, supervisor: "unsupported", forkContext: false, extensionBindings: false },
+			unsupportedReasons: PROMPT_FILE_UNSUPPORTED,
+			nonResumableReason: PROMPT_FILE_UNSUPPORTED.resume,
+		};
+	}
+	const adapter = adapterId === "codex-exec" || adapterId === "codex-exec-writer" || adapterId === "claude-code" || adapterId === "claude-code-writer" || adapterId === "cursor-agent" || adapterId === "cursor-agent-writer" ? adapterId : undefined;
 	return resolveExternalCliRunnerStatus({ ...(adapter ? { adapter } : {}), command: input.command, ...(args ? { args } : {}), ...(promptDelivery ? { promptDelivery } : {}) });
 }
 

@@ -1378,7 +1378,7 @@ export type AgentRunnerConfig =
 	| { type: "pi" }
 	| {
 		type: "external-cli";
-		adapter?: "codex-exec";
+		adapter?: "codex-exec" | "codex-exec-writer" | "claude-code" | "claude-code-writer" | "cursor-agent" | "cursor-agent-writer";
 		command: string;
 		args?: string[];
 		promptDelivery?: "stdin";
@@ -1404,9 +1404,16 @@ export interface ExternalCliCapabilities {
 }
 
 export interface ExternalCliReceiptMetadata {
-	adapter: { id: "external-cli" | "codex-exec"; version: 1; executionMode: "one-shot-stdin" };
+	adapter: { id: "external-cli" | "codex-exec" | "codex-exec-writer" | "claude-code" | "claude-code-writer" | "cursor-agent" | "cursor-agent-writer" | "grok-build"; version: 1; executionMode: "one-shot-stdin" | "one-shot-prompt-file" };
 	capabilities: ExternalCliCapabilities;
-	safety?: { sandbox: "read-only"; approvalPolicy: "never"; ephemeral: true };
+	safety?:
+		| { sandbox: "read-only"; approvalPolicy: "never"; ephemeral: true }
+		| { access: "workspace-write"; sandbox: "workspace-write"; approvalPolicy: "never"; ephemeral: true }
+		| { permissionMode: "plan"; tools: "none"; mcp: "empty-strict"; settingSources: "none"; sessionPersistence: false }
+		| { access: "read-only"; authentication: "existing-cli-required"; permissionMode: "plan"; tools: "none"; mcp: "empty-strict"; settingSources: "user"; userSettingsTrust: "required"; sessionPersistence: false }
+		| { access: "workspace-write"; authentication: "existing-cli-required"; permissionMode: "acceptEdits"; tools: "Read,Write,Edit,Glob,Grep"; mcp: "empty-strict"; settingSources: "user"; userSettingsTrust: "required"; sessionPersistence: false }
+		| { access: "read-only"; authentication: "cursor-api-key-or-existing-login"; mode: "ask"; sandbox: "enabled"; workspaceTrust: "existing-required"; sessionReuse: false }
+		| { access: "workspace-write"; authentication: "cursor-api-key-or-existing-login"; mode: "print"; sandbox: "enabled"; workspaceTrust: "existing-required"; sessionReuse: false };
 	outputArtifacts?: { stdoutPath?: string; stderrPath?: string; finalOutputPath?: string };
 	handoff: { mode: "fresh" };
 	supervisor: { mode: "unsupported"; reason: string };
@@ -1417,7 +1424,7 @@ export interface ExternalCliRunnerStatus {
 	type: "external-cli";
 	command: string;
 	args: string[];
-	promptDelivery: "stdin";
+	promptDelivery: "stdin" | "prompt-file";
 	adapter: ExternalCliReceiptMetadata["adapter"];
 	safety?: ExternalCliReceiptMetadata["safety"];
 	capabilities: ExternalCliCapabilities;
@@ -2094,6 +2101,11 @@ export interface ScheduledRunsConfig {
 	storeRoot?: string;
 }
 
+export interface ModelExclusionsConfig {
+	/** Default duration in milliseconds. A lower configured value also shortens active cached exclusions. */
+	defaultTtlMs?: number;
+}
+
 export type FleetViewPlacement = "aboveEditor" | "belowEditor";
 
 export const FLEET_KEYBINDING_ACTIONS = [
@@ -2142,6 +2154,8 @@ export interface ExtensionConfig {
 	fleetKeybindings?: FleetKeybindingsConfig;
 	/** Show the under-editor async runs widget. Defaults to true, including when FleetView is enabled. */
 	asyncWidget?: boolean;
+	/** Configure the process-wide TTL policy for persisted model exclusions. */
+	modelExclusions?: ModelExclusionsConfig;
 	/** Tool description variant registered for the parent-facing subagent tool. Defaults to split metadata. */
 	toolDescriptionMode?: ToolDescriptionMode;
 	/** Inline chat rendering for the subagent tool. Defaults to rich. */
