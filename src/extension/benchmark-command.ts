@@ -91,18 +91,19 @@ function bytes(value: unknown): number {
 	return Buffer.byteLength(JSON.stringify(value));
 }
 
-function belongsToPiSubagents(tool: ToolInfoLike): boolean {
-	const sourceInfo = tool.sourceInfo;
-	if (sourceInfo) {
-		const root = comparablePath(packageRoot);
-		for (const candidate of [sourceInfo.path, sourceInfo.baseDir]) {
-			if (!candidate) continue;
-			const normalized = comparablePath(candidate);
-			if (normalized === root || normalized.startsWith(`${root}/`)) return true;
-		}
-		if (typeof sourceInfo.source === "string" && sourceInfo.source.toLowerCase().includes("pi-subagents")) return true;
+function sourceInfoBelongsToPiSubagents(sourceInfo: SourceInfoLike | undefined): boolean {
+	if (!sourceInfo) return false;
+	const root = comparablePath(packageRoot);
+	for (const candidate of [sourceInfo.path, sourceInfo.baseDir]) {
+		if (!candidate) continue;
+		const normalized = comparablePath(candidate);
+		if (normalized === root || normalized.startsWith(`${root}/`)) return true;
 	}
-	return KNOWN_SUBAGENT_TOOL_NAMES.has(tool.name);
+	return typeof sourceInfo.source === "string" && sourceInfo.source.toLowerCase().includes("pi-subagents");
+}
+
+function belongsToPiSubagents(tool: ToolInfoLike): boolean {
+	return sourceInfoBelongsToPiSubagents(tool.sourceInfo) || KNOWN_SUBAGENT_TOOL_NAMES.has(tool.name);
 }
 
 function surfaceSnapshot(pi: ExtensionAPI) {
@@ -120,7 +121,7 @@ function surfaceSnapshot(pi: ExtensionAPI) {
 		piSubagentsModelFacingBytesByTool: Object.fromEntries(
 			subagentTools.map((tool) => [tool.name, bytes(modelFacingContract(tool))]),
 		),
-		piSubagentsOwnershipSourceInfoCount: subagentTools.filter((tool) => Boolean(tool.sourceInfo)).length,
+		piSubagentsOwnershipSourceInfoCount: subagentTools.filter((tool) => sourceInfoBelongsToPiSubagents(tool.sourceInfo)).length,
 		subagentWaitActive: active.has("subagent_wait"),
 	};
 }
