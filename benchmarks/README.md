@@ -1,32 +1,23 @@
 # pi-subagents benchmark
 
-Run it from a **fresh Pi session** in the `pi-subagents` repo:
+Run `/bench-subagent` from a fresh Pi session. The command resolves the installed package path, so the session cwd does not matter.
 
-```text
-/bench-subagent
-```
+## What it proves
 
-That command is a prompt template, not another always-loaded benchmark skill. This is intentional: benchmark instructions are read only when invoked, so the benchmark itself does not add a permanent model-context tax.
+The benchmark intentionally covers only four regression classes:
 
-## What it measures
+- startup context tax,
+- compact single + `calls[]` delegation,
+- advanced progressive disclosure + exact restoration to minimal,
+- async + `subagent_wait` progressive disclosure + exact restoration to minimal.
 
-- fixed/default context proxy: first parent turn usage before any subagent is loaded,
-- exact compact vs full tool-schema size,
-- compact single-child execution,
-- compact `calls[]` parallel execution,
-- worker edit correctness with deterministic tests,
-- advanced `workflowScript` progressive disclosure,
-- async + `subagent_wait` progressive disclosure,
-- restoring the compact surface,
-- parent/nested token and cache usage,
-- wall time and unnecessary capability/retry behavior,
-- two independent post-run reviews of the saved Pi session.
+Budget: **4 parent `subagent` calls / 5 child runs**. There are no reviewer agents, coding puzzles, or diagnostic retries.
 
-Hard pass/fail comes from deterministic checks. Reviewer subagents add diagnosis; they do not invent the benchmark score.
+PASS/FAIL is deterministic. Parent/child token usage and wall time are informational only. A clean functional run warns only for benchmark-relevant dirty runtime files or >5% growth in the minimal schema / pi-subagents model-facing tool definitions versus a comparable clean PASS.
 
 ## Results
 
-Generated data is intentionally outside the git checkout:
+Generated data stays outside the checkout:
 
 ```text
 ~/.pi/benchmarks/pi-subagents/
@@ -35,16 +26,9 @@ Generated data is intentionally outside the git checkout:
     ├── meta.json
     ├── static.json
     ├── metrics.json
-    ├── review-efficiency.md
-    ├── review-correctness.md
-    ├── report.md
-    └── workspace/
+    └── report.md
 ```
 
-Pi sessions remain in Pi's normal session store. The benchmark records the session path but does not copy the raw transcript into the benchmark directory.
+Pi keeps the raw parent/child sessions in its normal session store.
 
-## Comparison rule
-
-Static schema metrics and deterministic scenarios are comparable across environments. Token and wall-time deltas should only be treated as meaningful when benchmark version, Pi version, provider, and model are the same.
-
-When the benchmark itself changes materially, increment `benchmarks/benchmark.json` `version` rather than silently comparing unlike runs.
+Only compare benchmark rows with the same benchmark version, Pi version, provider, and model. Increment `benchmarks/benchmark.json` when the workload or measurement semantics change.
