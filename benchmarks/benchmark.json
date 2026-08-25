@@ -1,5 +1,7 @@
 {
   "name": "pi-subagents-agent-benchmark",
-  "version": 2,
-  "resultsRoot": "~/.pi/benchmarks/pi-subagents"
+  "version": 3,
+  "resultsRoot": "~/.pi/benchmarks/pi-subagents",
+  "expectedCoreSubagentCalls": 4,
+  "expectedChildRuns": 5
 }
