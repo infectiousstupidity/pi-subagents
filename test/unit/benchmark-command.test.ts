@@ -131,8 +131,8 @@ describe("bench-subagent command", () => {
 	it("generates workflow children with runs.run(key, params)", () => {
 		const scriptPath = fileURLToPath(new URL("../../benchmarks/scripts/start-run.mjs", import.meta.url));
 		const source = fs.readFileSync(scriptPath, "utf8");
-		assert.match(source, /runs\.run\(\\"seed\\", \{ agent:/);
-		assert.match(source, /runs\.run\(\\"write\\", \{ agent:/);
-		assert.doesNotMatch(source, /runs\.run\(\{ key:/);
+		assert.equal(source.includes('runs.run("seed", { agent:'), true);
+		assert.equal(source.includes('runs.run("write", { agent:'), true);
+		assert.equal(source.includes("runs.run({ key:"), false);
 	});
 });
