@@ -5,8 +5,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const benchmarkPath = fileURLToPath(new URL("../../benchmarks/BENCHMARK.md", import.meta.url));
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const STATE_TYPE = "pi-subagents-benchmark";
-const PROBE_MARKER = "BENCH_SUBAGENT_PROBE_V3";
-const SPEC_MARKER = "BENCH_SUBAGENT_V3";
+const PROBE_MARKER = "BENCH_SUBAGENT_PROBE_V4";
+const SPEC_MARKER = "BENCH_SUBAGENT_V4";
 const KNOWN_SUBAGENT_TOOL_NAMES = new Set(["subagent", "subagent_capability", "subagent_wait"]);
 
 type SourceInfoLike = {
@@ -131,7 +131,7 @@ function appendProbeState(pi: ExtensionAPI, ctx: {
 	getSystemPrompt(): string;
 }): void {
 	pi.appendEntry(STATE_TYPE, {
-		version: 3,
+		version: 4,
 		phase: "probe-sent",
 		at: Date.now(),
 		cleanContext: {
@@ -151,7 +151,7 @@ function sendResolvedSpec(pi: ExtensionAPI, ctx: { hasUI: boolean; ui: { notify(
 		if (ctx.hasUI) ctx.ui.notify(`Cannot load pi-subagents benchmark: ${message}`, "error");
 		return;
 	}
-	pi.appendEntry(STATE_TYPE, { version: 3, phase: "spec-sent", at: Date.now() });
+	pi.appendEntry(STATE_TYPE, { version: 4, phase: "spec-sent", at: Date.now() });
 	pi.sendUserMessage([
 		{ type: "text", text: SPEC_MARKER },
 		{ type: "text", text: `Resolved package root: ${portablePath(packageRoot)}\n\n${resolveBenchmarkSpec(source)}` },
@@ -196,7 +196,7 @@ export function registerBenchmarkCommand(pi: ExtensionAPI): void {
 	pi.on("tool_execution_end", (event) => {
 		if (!benchmarkActive || event.toolName !== "subagent_capability") return;
 		pi.appendEntry(STATE_TYPE, {
-			version: 3,
+			version: 4,
 			phase: "surface",
 			sequence: ++surfaceSequence,
 			at: Date.now(),
