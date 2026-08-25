@@ -5,9 +5,17 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const benchmarkPath = fileURLToPath(new URL("../../benchmarks/BENCHMARK.md", import.meta.url));
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const STATE_TYPE = "pi-subagents-benchmark";
-const PROBE_MARKER = "BENCH_SUBAGENT_PROBE_V2";
-const SPEC_MARKER = "BENCH_SUBAGENT_V2";
-const PI_SUBAGENT_TOOL_NAMES = new Set(["subagent", "subagent_capability", "subagent_wait"]);
+const PROBE_MARKER = "BENCH_SUBAGENT_PROBE_V3";
+const SPEC_MARKER = "BENCH_SUBAGENT_V3";
+const SUBAGENT_TOOL_NAMES = new Set(["subagent", "subagent_capability", "subagent_wait"]);
+
+type ToolInfoLike = {
+	name: string;
+	description?: string;
+	parameters?: unknown;
+	promptSnippet?: string;
+	promptGuidelines?: unknown;
+};
 
 function portablePath(value: string): string {
 	return value.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -62,48 +70,51 @@ function hasExistingUserMessage(branch: unknown[]): boolean {
 	});
 }
 
-function activeToolMetrics(pi: ExtensionAPI) {
-	try {
-		const activeToolNames = pi.getActiveTools();
-		const active = new Set(activeToolNames);
-		const activeTools = pi.getAllTools().filter((tool) => active.has(tool.name));
-		const piSubagentsTools = activeTools.filter((tool) => PI_SUBAGENT_TOOL_NAMES.has(tool.name));
-		const piSubagentsToolDefinitionBytesByName = Object.fromEntries(
-			piSubagentsTools.map((tool) => [tool.name, Buffer.byteLength(JSON.stringify(tool))]),
-		);
-		return {
-			activeToolNames,
-			activeToolDefinitionBytes: Buffer.byteLength(JSON.stringify(activeTools)),
-			piSubagentsActiveToolNames: piSubagentsTools.map((tool) => tool.name),
-			piSubagentsActiveToolDefinitionBytes: Buffer.byteLength(JSON.stringify(piSubagentsTools)),
-			piSubagentsToolDefinitionBytesByName,
-			subagentWaitActive: active.has("subagent_wait"),
-		};
-	} catch {
-		return {
-			activeToolNames: pi.getActiveTools(),
-			activeToolDefinitionBytes: -1,
-			piSubagentsActiveToolNames: [],
-			piSubagentsActiveToolDefinitionBytes: -1,
-			piSubagentsToolDefinitionBytesByName: {},
-			subagentWaitActive: pi.getActiveTools().includes("subagent_wait"),
-		};
-	}
+function modelFacingContract(tool: ToolInfoLike): Record<string, unknown> {
+	return {
+		name: tool.name,
+		description: tool.description,
+		parameters: tool.parameters,
+		...(tool.promptSnippet !== undefined ? { promptSnippet: tool.promptSnippet } : {}),
+		...(tool.promptGuidelines !== undefined ? { promptGuidelines: tool.promptGuidelines } : {}),
+	};
+}
+
+function bytes(value: unknown): number {
+	return Buffer.byteLength(JSON.stringify(value));
+}
+
+function surfaceSnapshot(pi: ExtensionAPI) {
+	const activeToolNames = pi.getActiveTools();
+	const active = new Set(activeToolNames);
+	const activeTools = (pi.getAllTools() as ToolInfoLike[]).filter((tool) => active.has(tool.name));
+	const activeContracts = activeTools.map(modelFacingContract);
+	const subagentTools = activeTools.filter((tool) => SUBAGENT_TOOL_NAMES.has(tool.name));
+	const subagentContracts = subagentTools.map(modelFacingContract);
+	return {
+		activeToolNames,
+		activeModelFacingToolDefinitionBytes: bytes(activeContracts),
+		piSubagentsActiveToolNames: subagentTools.map((tool) => tool.name),
+		piSubagentsModelFacingToolDefinitionBytes: bytes(subagentContracts),
+		piSubagentsModelFacingBytesByTool: Object.fromEntries(
+			subagentTools.map((tool) => [tool.name, bytes(modelFacingContract(tool))]),
+		),
+		subagentWaitActive: active.has("subagent_wait"),
+	};
 }
 
 function appendProbeState(pi: ExtensionAPI, ctx: {
 	getContextUsage(): unknown;
 	getSystemPrompt(): string;
 }): void {
-	const usage = ctx.getContextUsage();
 	pi.appendEntry(STATE_TYPE, {
-		version: 2,
+		version: 3,
 		phase: "probe-sent",
 		at: Date.now(),
 		cleanContext: {
-			usage: usage ?? null,
+			usage: ctx.getContextUsage() ?? null,
 			systemPromptBytes: Buffer.byteLength(ctx.getSystemPrompt()),
-			...activeToolMetrics(pi),
+			surface: surfaceSnapshot(pi),
 		},
 	});
 }
@@ -117,7 +128,7 @@ function sendResolvedSpec(pi: ExtensionAPI, ctx: { hasUI: boolean; ui: { notify(
 		if (ctx.hasUI) ctx.ui.notify(`Cannot load pi-subagents benchmark: ${message}`, "error");
 		return;
 	}
-	pi.appendEntry(STATE_TYPE, { version: 2, phase: "spec-sent", at: Date.now() });
+	pi.appendEntry(STATE_TYPE, { version: 3, phase: "spec-sent", at: Date.now() });
 	pi.sendUserMessage([
 		{ type: "text", text: SPEC_MARKER },
 		{ type: "text", text: `Resolved package root: ${portablePath(packageRoot)}\n\n${resolveBenchmarkSpec(source)}` },
@@ -125,8 +136,16 @@ function sendResolvedSpec(pi: ExtensionAPI, ctx: { hasUI: boolean; ui: { notify(
 }
 
 export function registerBenchmarkCommand(pi: ExtensionAPI): void {
+	let benchmarkActive = false;
+	let surfaceSequence = 0;
+
+	pi.on("session_start", () => {
+		benchmarkActive = false;
+		surfaceSequence = 0;
+	});
+
 	pi.registerCommand("bench-subagent", {
-		description: "Run the reproducible pi-subagents benchmark",
+		description: "Run the minimal reproducible pi-subagents benchmark",
 		handler: async (_args, ctx) => {
 			if (!ctx.isIdle()) {
 				if (ctx.hasUI) ctx.ui.notify("Wait for the current turn to finish, then run /bench-subagent in a new session.", "warning");
@@ -137,16 +156,28 @@ export function registerBenchmarkCommand(pi: ExtensionAPI): void {
 				return;
 			}
 
+			benchmarkActive = true;
+			surfaceSequence = 0;
 			appendProbeState(pi, ctx);
-			pi.sendUserMessage(
-				`${PROBE_MARKER}\nReply exactly BENCH_PROBE_OK and do not call tools.`,
-			);
+			pi.sendUserMessage(`${PROBE_MARKER}\nReply exactly BENCH_PROBE_OK and do not call tools.`);
 		},
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
+		if (!benchmarkActive) return;
 		const branch = ctx.sessionManager.getBranch() as unknown[];
 		if (!hasUserMarker(branch, PROBE_MARKER) || hasUserMarker(branch, SPEC_MARKER)) return;
 		sendResolvedSpec(pi, ctx);
+	});
+
+	pi.on("tool_execution_end", (event) => {
+		if (!benchmarkActive || event.toolName !== "subagent_capability") return;
+		pi.appendEntry(STATE_TYPE, {
+			version: 3,
+			phase: "surface",
+			sequence: ++surfaceSequence,
+			at: Date.now(),
+			surface: surfaceSnapshot(pi),
+		});
 	});
 }
