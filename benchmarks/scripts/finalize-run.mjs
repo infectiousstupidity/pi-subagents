@@ -106,14 +106,14 @@ fs.writeFileSync(reportPath, report);
 
 const resultsPath = path.join(resultsRoot, "RESULTS.md");
 fs.mkdirSync(resultsRoot, { recursive: true });
-const v3Header = `# pi-subagents benchmark results\n\nv3 measures only startup context tax, compact delegation, progressive disclosure, and async/wait. Parent/child token usage and wall time are informational and never change status.\n\n## Benchmark v3\n\n| Date | Run | pkg | commit | Pi | model | clean prompt | pi-subagents defs | minimal/full | function | parent | nested | wall | relevant dirty | status | report |\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n<!-- BENCHMARK_V3_ROWS -->\n`;
+const v4Header = `# pi-subagents benchmark results\n\nv4 keeps the v3 workload but corrects clean-prompt accounting, probe contamination checks, dirty-worktree parsing, and package tool attribution. Parent/child token usage and wall time are informational only.\n\n## Benchmark v4\n\n| Date | Run | pkg | commit | Pi | model | clean prompt | pi-subagents defs | minimal/full | function | parent | nested | wall | relevant dirty | status | report |\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n<!-- BENCHMARK_V4_ROWS -->\n`;
 
 if (!fs.existsSync(resultsPath)) {
-  fs.writeFileSync(resultsPath, v3Header);
+  fs.writeFileSync(resultsPath, v4Header);
 } else {
   const existing = fs.readFileSync(resultsPath, "utf8");
-  if (!existing.includes("<!-- BENCHMARK_V3_ROWS -->")) {
-    fs.writeFileSync(resultsPath, `${v3Header}\n## Legacy benchmark results\n\n${existing.trim()}\n`);
+  if (!existing.includes("<!-- BENCHMARK_V4_ROWS -->")) {
+    fs.writeFileSync(resultsPath, `${v4Header}\n## Legacy benchmark results\n\n${existing.trim()}\n`);
   }
 }
 
@@ -121,7 +121,7 @@ let results = fs.readFileSync(resultsPath, "utf8");
 if (!results.includes(`| ${runId} |`)) {
   const date = meta.startedAt.slice(0, 10);
   const row = `| ${date} | ${runId} | ${meta.packageVersion} | ${String(meta.commit).slice(0, 8)} | ${meta.piVersion} | ${metrics.provider}/${metrics.model} | ${cleanPromptTokens} | ${initialBytes} | ${metrics.static.minimalSchemaBytes}/${metrics.static.fullSchemaBytes} (${(metrics.static.minimalToFullRatio * 100).toFixed(1)}%) | ${metrics.scenarioPassed}/${metrics.scenarioTotal} | ${metrics.parentUsage.totalTokens} | ${metrics.nestedSubagentUsage.totalTokens} | ${(metrics.coreWallMs / 1000).toFixed(1)}s | ${meta.repoRelevantDirty ? "yes" : "no"} | **${overall}** | [report](runs/${runId}/report.md) |\n`;
-  results = results.replace("<!-- BENCHMARK_V3_ROWS -->", `${row}<!-- BENCHMARK_V3_ROWS -->`);
+  results = results.replace("<!-- BENCHMARK_V4_ROWS -->", `${row}<!-- BENCHMARK_V4_ROWS -->`);
   fs.writeFileSync(resultsPath, results);
 }
 
