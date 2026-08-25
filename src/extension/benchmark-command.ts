@@ -7,6 +7,7 @@ const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const STATE_TYPE = "pi-subagents-benchmark";
 const PROBE_MARKER = "BENCH_SUBAGENT_PROBE_V2";
 const SPEC_MARKER = "BENCH_SUBAGENT_V2";
+const PI_SUBAGENT_TOOL_NAMES = new Set(["subagent", "subagent_capability", "subagent_wait"]);
 
 function portablePath(value: string): string {
 	return value.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -61,13 +62,32 @@ function hasExistingUserMessage(branch: unknown[]): boolean {
 	});
 }
 
-function activeToolBytes(pi: ExtensionAPI): number {
+function activeToolMetrics(pi: ExtensionAPI) {
 	try {
-		const active = new Set(pi.getActiveTools());
-		const tools = pi.getAllTools().filter((tool) => active.has(tool.name));
-		return Buffer.byteLength(JSON.stringify(tools));
+		const activeToolNames = pi.getActiveTools();
+		const active = new Set(activeToolNames);
+		const activeTools = pi.getAllTools().filter((tool) => active.has(tool.name));
+		const piSubagentsTools = activeTools.filter((tool) => PI_SUBAGENT_TOOL_NAMES.has(tool.name));
+		const piSubagentsToolDefinitionBytesByName = Object.fromEntries(
+			piSubagentsTools.map((tool) => [tool.name, Buffer.byteLength(JSON.stringify(tool))]),
+		);
+		return {
+			activeToolNames,
+			activeToolDefinitionBytes: Buffer.byteLength(JSON.stringify(activeTools)),
+			piSubagentsActiveToolNames: piSubagentsTools.map((tool) => tool.name),
+			piSubagentsActiveToolDefinitionBytes: Buffer.byteLength(JSON.stringify(piSubagentsTools)),
+			piSubagentsToolDefinitionBytesByName,
+			subagentWaitActive: active.has("subagent_wait"),
+		};
 	} catch {
-		return -1;
+		return {
+			activeToolNames: pi.getActiveTools(),
+			activeToolDefinitionBytes: -1,
+			piSubagentsActiveToolNames: [],
+			piSubagentsActiveToolDefinitionBytes: -1,
+			piSubagentsToolDefinitionBytesByName: {},
+			subagentWaitActive: pi.getActiveTools().includes("subagent_wait"),
+		};
 	}
 }
 
@@ -83,8 +103,7 @@ function appendProbeState(pi: ExtensionAPI, ctx: {
 		cleanContext: {
 			usage: usage ?? null,
 			systemPromptBytes: Buffer.byteLength(ctx.getSystemPrompt()),
-			activeToolNames: pi.getActiveTools(),
-			activeToolDefinitionBytes: activeToolBytes(pi),
+			...activeToolMetrics(pi),
 		},
 	});
 }
