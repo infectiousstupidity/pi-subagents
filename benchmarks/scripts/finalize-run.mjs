@@ -16,55 +16,6 @@ const metricsPath = path.join(runDir, "metrics.json");
 const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
 const metrics = JSON.parse(fs.readFileSync(metricsPath, "utf8"));
 
-function parseReviewVerdict(text) {
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine
-      .trim()
-      .replace(/^(?:[-+*>]\s*)+/, "")
-      .replace(/[*_`]/g, "")
-      .trim();
-    const match = line.match(/^VERDICT\s*:\s*(PASS|WARN|FAIL)\s*$/i);
-    if (match) return match[1].toUpperCase();
-  }
-  return "INVALID";
-}
-
-function readReview(name) {
-  const file = path.join(runDir, name);
-  if (!fs.existsSync(file)) return { verdict: "MISSING", text: "(missing review)" };
-  const text = fs.readFileSync(file, "utf8").trim();
-  return { verdict: parseReviewVerdict(text), text };
-}
-const efficiencyReview = readReview("review-efficiency.md");
-const correctnessReview = readReview("review-correctness.md");
-
-function parseSessionToolCalls(sessionPath) {
-  const calls = [];
-  if (!sessionPath || !fs.existsSync(sessionPath)) return calls;
-  for (const line of fs.readFileSync(sessionPath, "utf8").split(/\r?\n/).filter(Boolean)) {
-    const entry = JSON.parse(line);
-    if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
-    for (const part of entry.message.content ?? []) {
-      if (part?.type === "toolCall") calls.push({ timestamp: Date.parse(entry.timestamp ?? 0), name: part.name, args: part.arguments ?? {} });
-    }
-  }
-  return calls;
-}
-
-const allCalls = parseSessionToolCalls(metrics.sessionPath);
-const postCoreCalls = allCalls.filter((call) => Number.isFinite(call.timestamp) && call.timestamp > meta.coreEndedAtMs + 500);
-const reviewCall = postCoreCalls.find((call) => call.name === "subagent" && JSON.stringify(call.args).includes("[BENCH:REVIEW:EFFICIENCY]"));
-const postCoreCapabilityLoads = postCoreCalls.filter((call) => call.name === "subagent_capability");
-const postReviewCompactPass = Boolean(
-  reviewCall
-  && reviewCall.args.async === false
-  && Array.isArray(reviewCall.args.calls)
-  && reviewCall.args.calls.length === 2
-  && postCoreCapabilityLoads.length === 0
-);
-metrics.postReviewCompactPass = postReviewCompactPass;
-fs.writeFileSync(metricsPath, `${JSON.stringify(metrics, null, 2)}\n`);
-
 function previousComparableRun() {
   const runsRoot = path.join(resultsRoot, "runs");
   if (!fs.existsSync(runsRoot)) return null;
@@ -80,8 +31,7 @@ function previousComparableRun() {
       if (otherMeta.benchmarkVersion !== meta.benchmarkVersion) continue;
       if (otherMeta.piVersion !== meta.piVersion) continue;
       if (otherMetrics.provider !== metrics.provider || otherMetrics.model !== metrics.model) continue;
-      // Failed/incomplete runs are diagnostics, not performance baselines.
-      if (otherMetrics.deterministicPass !== true || otherMetrics.postReviewCompactPass !== true) continue;
+      if (otherMetrics.overall !== "PASS" || otherMeta.repoRelevantDirty) continue;
       candidates.push({ meta: otherMeta, metrics: otherMetrics });
     } catch {}
   }
@@ -91,38 +41,29 @@ function previousComparableRun() {
 
 const previous = previousComparableRun();
 const pct = (current, prior) => prior > 0 ? ((current - prior) / prior) * 100 : null;
+const initialBytes = Number(metrics.cleanContext?.surface?.piSubagentsModelFacingToolDefinitionBytes ?? 0);
 const comparison = previous ? {
   runId: previous.meta.runId,
   minimalSchemaBytesPct: pct(metrics.static.minimalSchemaBytes, previous.metrics.static?.minimalSchemaBytes ?? 0),
+  piSubagentsModelFacingBytesPct: pct(initialBytes, previous.metrics.cleanContext?.surface?.piSubagentsModelFacingToolDefinitionBytes ?? 0),
   cleanProbeTotalTokensPct: pct(metrics.cleanProbeUsage.totalTokens, previous.metrics.cleanProbeUsage?.totalTokens ?? 0),
   coreParentTotalTokensPct: pct(metrics.parentUsage.totalTokens, previous.metrics.parentUsage?.totalTokens ?? 0),
   nestedSubagentTotalTokensPct: pct(metrics.nestedSubagentUsage.totalTokens, previous.metrics.nestedSubagentUsage?.totalTokens ?? 0),
   coreWallMsPct: pct(metrics.coreWallMs, previous.metrics.coreWallMs ?? 0),
 } : null;
 
-const reviewFail = efficiencyReview.verdict === "FAIL"
-  || correctnessReview.verdict === "FAIL"
-  || efficiencyReview.verdict === "INVALID"
-  || correctnessReview.verdict === "INVALID";
-const reviewWarn = efficiencyReview.verdict === "WARN" || correctnessReview.verdict === "WARN";
-const disciplineWarn = !metrics.toolDiscipline.capabilityDiscipline || metrics.toolDiscipline.extraSubagentCalls > 0;
-const dirtyWorktreeWarn = meta.repoDirty === true;
-const comparableWarn = Boolean(comparison && (
+const contextRegressionWarn = Boolean(comparison && (
   (comparison.minimalSchemaBytesPct ?? 0) > 5
-  || (comparison.cleanProbeTotalTokensPct ?? 0) > 15
-  || (comparison.coreParentTotalTokensPct ?? 0) > 25
-  || (comparison.nestedSubagentTotalTokensPct ?? 0) > 25
-  || (comparison.coreWallMsPct ?? 0) > 50
+  || (comparison.piSubagentsModelFacingBytesPct ?? 0) > 5
 ));
-const hardPass = metrics.deterministicPass
-  && postReviewCompactPass
-  && efficiencyReview.verdict !== "MISSING"
-  && correctnessReview.verdict !== "MISSING";
-const overall = !hardPass || reviewFail
+const overall = !metrics.deterministicPass
   ? "FAIL"
-  : reviewWarn || disciplineWarn || dirtyWorktreeWarn || comparableWarn
+  : meta.repoRelevantDirty || contextRegressionWarn
     ? "WARN"
     : "PASS";
+metrics.overall = overall;
+metrics.contextRegressionWarn = contextRegressionWarn;
+fs.writeFileSync(metricsPath, `${JSON.stringify(metrics, null, 2)}\n`);
 
 function fmtUsage(usage) {
   return `input ${usage.input} · output ${usage.output} · cache-read ${usage.cacheRead} · cache-write ${usage.cacheWrite} · total ${usage.totalTokens}`;
@@ -131,82 +72,67 @@ function fmtPct(value) {
   if (value === null || value === undefined || !Number.isFinite(value)) return "n/a";
   return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
 }
-function fmtContext(value) {
-  if (!value) return "unavailable";
-  const usage = value.usage;
-  const rawTokens = Number(usage?.tokens ?? NaN);
-  const window = usage?.contextWindow ?? "unknown";
-  const preRequest = Number.isFinite(rawTokens) && rawTokens > 0
-    ? `${rawTokens}/${window} pre-request tokens`
-    : "pre-request token estimate unavailable before first provider call";
-  const subagentDefs = value.piSubagentsActiveToolDefinitionBytes ?? "?";
-  const subagentNames = Array.isArray(value.piSubagentsActiveToolNames) ? value.piSubagentsActiveToolNames.join(", ") : "?";
-  return `${preRequest} · system ${value.systemPromptBytes ?? "?"} B · all active tools ${value.activeToolNames?.length ?? "?"} / defs ${value.activeToolDefinitionBytes ?? "?"} B · pi-subagents defs ${subagentDefs} B (${subagentNames}) · wait active ${value.subagentWaitActive === true ? "yes" : "no"}`;
-}
-function fenced(value) {
-  const text = Array.isArray(value) ? value.join("\n") : String(value ?? "");
+function fenced(lines) {
+  const text = Array.isArray(lines) ? lines.join("\n") : String(lines ?? "");
   return text.trim() ? `\n\`\`\`text\n${text.trim()}\n\`\`\`\n` : "\n(none)\n";
 }
 
 const scenarioRows = Object.entries(metrics.scenarios).map(([name, pass]) => `| ${name} | ${pass ? "PASS" : "FAIL"} |`).join("\n");
-const dirtyDetails = meta.repoDirty
-  ? `\n### Dirty worktree warning\n\nThis run is not a clean-commit baseline. Status:${fenced(meta.repoStatus)}\nDiff stat:${fenced(meta.repoDiffStat)}\n`
-  : "";
+const surface = metrics.cleanContext?.surface ?? {};
+const byTool = surface.piSubagentsModelFacingBytesByTool ?? {};
+const dirtySection = meta.repoRelevantDirty
+  ? `\n## Relevant dirty-worktree warning\n\nThis run is not a clean baseline. Relevant status:${fenced(meta.repoRelevantStatus)}\nFull diff stat:${fenced(meta.repoDiffStat)}\n`
+  : meta.repoDirty
+    ? `\nNon-runtime dirty files were present and intentionally ignored for baseline status:${fenced(meta.repoStatus)}\n`
+    : "";
+
 const report = `# pi-subagents benchmark v${meta.benchmarkVersion} — ${runId}\n\n`
-+ `Overall: **${overall}**  \nDeterministic: **${metrics.deterministicPass && postReviewCompactPass ? "PASS" : "FAIL"}**  \nScenarios: **${metrics.scenarioPassed}/${metrics.scenarioTotal} core/probe + post-review compact ${postReviewCompactPass ? "PASS" : "FAIL"}**\n\n`
-+ `## Environment\n\n| Field | Value |\n|---|---|\n| Benchmark | v${meta.benchmarkVersion} |\n| pi-subagents | ${meta.packageVersion} |\n| Commit | \`${meta.commit}\` |\n| Branch | ${meta.branch} |\n| Repo dirty | ${meta.repoDirty ? "YES — warning" : "no"} |\n| Pi | ${meta.piVersion} |\n| Provider/model | ${metrics.provider}/${metrics.model} |\n| Node | ${meta.nodeVersion} |\n| Platform | ${meta.platform} |\n| Session | \`${metrics.sessionPath}\` |\n${dirtyDetails}\n`
-+ `## Deterministic checks\n\n| Scenario | Result |\n|---|---|\n${scenarioRows}\n| postReviewCompact | ${postReviewCompactPass ? "PASS" : "FAIL"} |\n\n`
-+ `## Clean starting context\n\n- Probe (actual first provider request): ${fmtUsage(metrics.cleanProbeUsage)}\n- Pre-request snapshot: ${fmtContext(metrics.cleanContext)}\n- Pi-subagents active tool-definition bytes: ${metrics.cleanContext?.piSubagentsActiveToolDefinitionBytes ?? "unavailable"}\n\n`
-+ `## Context surface\n\n| Metric | Value |\n|---|---:|\n| Minimal schema | ${metrics.static.minimalSchemaBytes} bytes |\n| Full schema | ${metrics.static.fullSchemaBytes} bytes |\n| Minimal/full | ${(metrics.static.minimalToFullRatio * 100).toFixed(2)}% |\n| Minimal fields | ${metrics.static.minimalFieldCount} |\n| Full fields | ${metrics.static.fullFieldCount} |\n| Minimal description | ${metrics.static.minimalDescriptionBytes} bytes |\n| Capability schema | ${metrics.static.capabilitySchemaBytes} bytes |\n\n`
-+ `## Measured core\n\n- Parent: ${fmtUsage(metrics.parentUsage)}\n- Nested subagents: ${fmtUsage(metrics.nestedSubagentUsage)}\n- Core wall time: ${(metrics.coreWallMs / 1000).toFixed(1)}s\n- Capability sequence: \`${metrics.toolDiscipline.capabilitySequence.join(" → ")}\`\n- Extra core subagent calls: ${metrics.toolDiscipline.extraSubagentCalls}\n- Nested usage evidence: ${metrics.nestedUsageEvidence.syncUsageSources} sync aggregate(s), ${metrics.nestedUsageEvidence.asyncJsonlPaths.length} async JSONL path(s)\n\n`
-+ `## Comparable previous v${meta.benchmarkVersion} run\n\n${comparison ? `Previous: \`${comparison.runId}\`\n\n| Metric | Delta |\n|---|---:|\n| Minimal schema bytes | ${fmtPct(comparison.minimalSchemaBytesPct)} |\n| Clean probe tokens | ${fmtPct(comparison.cleanProbeTotalTokensPct)} |\n| Core parent tokens | ${fmtPct(comparison.coreParentTotalTokensPct)} |\n| Nested subagent tokens | ${fmtPct(comparison.nestedSubagentTotalTokensPct)} |\n| Core wall time | ${fmtPct(comparison.coreWallMsPct)} |` : "No prior successful run with the same benchmark version, Pi version, provider, and model."}\n\n`
-+ `## Independent reviews\n\n### Efficiency — ${efficiencyReview.verdict}\n\n${efficiencyReview.text}\n\n### Correctness — ${correctnessReview.verdict}\n\n${correctnessReview.text}\n`;
++ `Status: **${overall}**  \nScenarios: **${metrics.scenarioPassed}/${metrics.scenarioTotal}**  \nDiscipline: **${metrics.toolDiscipline.pass ? "PASS" : "FAIL"}**\n\n`
++ `## Context tax\n\n| Metric | Value |\n|---|---:|\n| Clean probe tokens | ${metrics.cleanProbeUsage.totalTokens} |\n| System prompt | ${metrics.cleanContext?.systemPromptBytes ?? "n/a"} bytes |\n| All active model-facing tool defs | ${surface.activeModelFacingToolDefinitionBytes ?? "n/a"} bytes |\n| pi-subagents model-facing defs | ${surface.piSubagentsModelFacingToolDefinitionBytes ?? "n/a"} bytes |\n| subagent | ${byTool.subagent ?? "n/a"} bytes |\n| subagent_capability | ${byTool.subagent_capability ?? "n/a"} bytes |\n| subagent_wait initially active | ${surface.subagentWaitActive ? "YES" : "no"} |\n| Minimal schema | ${metrics.static.minimalSchemaBytes} bytes |\n| Full schema | ${metrics.static.fullSchemaBytes} bytes |\n| Minimal/full | ${(metrics.static.minimalToFullRatio * 100).toFixed(2)}% |\n\n`
++ `## Function\n\n| Check | Result |\n|---|---|\n${scenarioRows}\n\n`
++ `## Discipline\n\n- Capability sequence: \`${metrics.toolDiscipline.capabilitySequence.join(" → ")}\`\n- Parent subagent calls: ${metrics.toolDiscipline.subagentCalls}/${metrics.toolDiscipline.expectedCoreSubagentCalls}\n- Expected child runs: ${metrics.toolDiscipline.expectedChildRuns}\n- Extra/retry subagent calls: ${metrics.toolDiscipline.extraSubagentCalls}\n- Wait calls: ${metrics.toolDiscipline.waitCalls}\n\n`
++ `## Informational usage\n\n- Parent: ${fmtUsage(metrics.parentUsage)}\n- Nested subagents: ${fmtUsage(metrics.nestedSubagentUsage)}\n- Core wall time: ${(metrics.coreWallMs / 1000).toFixed(1)}s\n\n`
++ `## Comparable previous v${meta.benchmarkVersion} PASS\n\n${comparison ? `Previous: \`${comparison.runId}\`\n\n| Metric | Delta | Affects status |\n|---|---:|---|\n| Minimal schema bytes | ${fmtPct(comparison.minimalSchemaBytesPct)} | yes, >5% warns |\n| pi-subagents model-facing defs | ${fmtPct(comparison.piSubagentsModelFacingBytesPct)} | yes, >5% warns |\n| Clean probe tokens | ${fmtPct(comparison.cleanProbeTotalTokensPct)} | no |\n| Core parent tokens | ${fmtPct(comparison.coreParentTotalTokensPct)} | no |\n| Nested subagent tokens | ${fmtPct(comparison.nestedSubagentTotalTokensPct)} | no |\n| Core wall time | ${fmtPct(comparison.coreWallMsPct)} | no |` : "No prior clean PASS with the same benchmark version, Pi version, provider, and model."}\n`
++ dirtySection;
 const reportPath = path.join(runDir, "report.md");
 fs.writeFileSync(reportPath, report);
 
 const resultsPath = path.join(resultsRoot, "RESULTS.md");
 fs.mkdirSync(resultsRoot, { recursive: true });
-const v2Header = `# pi-subagents benchmark results\n\nv2 separates the clean-context probe from the benchmark workload. Token/time comparisons are meaningful only between comparable successful v2 environments.\n\n## Benchmark v2\n\n| Date | Run | pkg | commit | Pi | model | clean probe | clean ctx | minimal/full | core parent | nested | scenarios | review E/C | wall | status | report |\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---|\n<!-- BENCHMARK_V2_ROWS -->\n`;
+const v3Header = `# pi-subagents benchmark results\n\nv3 measures only startup context tax, compact delegation, progressive disclosure, and async/wait. Parent/child token usage and wall time are informational and never change status.\n\n## Benchmark v3\n\n| Date | Run | pkg | commit | Pi | model | probe tokens | pi-subagents defs | minimal/full | function | parent | nested | wall | relevant dirty | status | report |\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n<!-- BENCHMARK_V3_ROWS -->\n`;
 
 if (!fs.existsSync(resultsPath)) {
-  fs.writeFileSync(resultsPath, v2Header);
+  fs.writeFileSync(resultsPath, v3Header);
 } else {
-  let existing = fs.readFileSync(resultsPath, "utf8");
-  if (!existing.includes("<!-- BENCHMARK_V2_ROWS -->")) {
-    const legacy = existing.trim();
-    fs.writeFileSync(resultsPath, `${v2Header}\n## Legacy benchmark results\n\n${legacy}\n`);
+  const existing = fs.readFileSync(resultsPath, "utf8");
+  if (!existing.includes("<!-- BENCHMARK_V3_ROWS -->")) {
+    fs.writeFileSync(resultsPath, `${v3Header}\n## Legacy benchmark results\n\n${existing.trim()}\n`);
   }
 }
 
 let results = fs.readFileSync(resultsPath, "utf8");
 if (!results.includes(`| ${runId} |`)) {
   const date = meta.startedAt.slice(0, 10);
-  const rawCleanCtxTokens = Number(metrics.cleanContext?.usage?.tokens ?? NaN);
-  const cleanCtxDisplay = Number.isFinite(rawCleanCtxTokens) && rawCleanCtxTokens > 0 ? rawCleanCtxTokens : "see probe";
-  const row = `| ${date} | ${runId} | ${meta.packageVersion} | ${String(meta.commit).slice(0, 8)} | ${meta.piVersion} | ${metrics.provider}/${metrics.model} | ${metrics.cleanProbeUsage.totalTokens} | ${cleanCtxDisplay} | ${metrics.static.minimalSchemaBytes}/${metrics.static.fullSchemaBytes} (${(metrics.static.minimalToFullRatio * 100).toFixed(1)}%) | ${metrics.parentUsage.totalTokens} | ${metrics.nestedSubagentUsage.totalTokens} | ${metrics.scenarioPassed}/${metrics.scenarioTotal}+${postReviewCompactPass ? "1" : "0"} | ${efficiencyReview.verdict}/${correctnessReview.verdict} | ${(metrics.coreWallMs / 1000).toFixed(1)}s | **${overall}** | [report](runs/${runId}/report.md) |\n`;
-  results = results.replace("<!-- BENCHMARK_V2_ROWS -->", `${row}<!-- BENCHMARK_V2_ROWS -->`);
+  const row = `| ${date} | ${runId} | ${meta.packageVersion} | ${String(meta.commit).slice(0, 8)} | ${meta.piVersion} | ${metrics.provider}/${metrics.model} | ${metrics.cleanProbeUsage.totalTokens} | ${initialBytes} | ${metrics.static.minimalSchemaBytes}/${metrics.static.fullSchemaBytes} (${(metrics.static.minimalToFullRatio * 100).toFixed(1)}%) | ${metrics.scenarioPassed}/${metrics.scenarioTotal} | ${metrics.parentUsage.totalTokens} | ${metrics.nestedSubagentUsage.totalTokens} | ${(metrics.coreWallMs / 1000).toFixed(1)}s | ${meta.repoRelevantDirty ? "yes" : "no"} | **${overall}** | [report](runs/${runId}/report.md) |\n`;
+  results = results.replace("<!-- BENCHMARK_V3_ROWS -->", `${row}<!-- BENCHMARK_V3_ROWS -->`);
   fs.writeFileSync(resultsPath, results);
 }
 
 process.stdout.write(`${JSON.stringify({
   runId,
   overall,
-  deterministicPass: metrics.deterministicPass && postReviewCompactPass,
-  scenarios: `${metrics.scenarioPassed}/${metrics.scenarioTotal}+post-review:${postReviewCompactPass ? "pass" : "fail"}`,
+  scenarios: `${metrics.scenarioPassed}/${metrics.scenarioTotal}`,
   cleanProbeUsage: metrics.cleanProbeUsage,
-  cleanContext: metrics.cleanContext,
-  piSubagentsActiveToolDefinitionBytes: metrics.cleanContext?.piSubagentsActiveToolDefinitionBytes ?? null,
+  piSubagentsModelFacingToolDefinitionBytes: initialBytes,
   minimalSchemaBytes: metrics.static.minimalSchemaBytes,
   fullSchemaBytes: metrics.static.fullSchemaBytes,
   minimalToFullRatio: metrics.static.minimalToFullRatio,
-  coreParentTokens: metrics.parentUsage.totalTokens,
-  nestedSubagentTokens: metrics.nestedSubagentUsage.totalTokens,
-  coreWallMs: metrics.coreWallMs,
   capabilitySequence: metrics.toolDiscipline.capabilitySequence,
   extraSubagentCalls: metrics.toolDiscipline.extraSubagentCalls,
-  repoDirty: meta.repoDirty,
-  efficiencyReview: efficiencyReview.verdict,
-  correctnessReview: correctnessReview.verdict,
+  parentTokens: metrics.parentUsage.totalTokens,
+  nestedSubagentTokens: metrics.nestedSubagentUsage.totalTokens,
+  coreWallMs: metrics.coreWallMs,
+  repoRelevantDirty: Boolean(meta.repoRelevantDirty),
   resultsPath,
   reportPath,
 }, null, 2)}\n`);
