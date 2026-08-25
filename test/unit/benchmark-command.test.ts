@@ -18,13 +18,16 @@ function harness(initialBranch: unknown[] = []) {
 	const notifications: string[] = [];
 	const handlers = new Map<string, (event: any, ctx: any) => void | Promise<void>>();
 	let branch = initialBranch;
-	let activeTools = ["read", "bash", "subagent", "subagent_capability"];
+	let activeTools = ["read", "bash", "subagent", "subagent_capability", "future_package_tool"];
+	const packageSource = { path: "/outside/package.ts", source: "github:infectiousstupidity/pi-subagents", scope: "user", origin: "package" };
+	const otherSource = { path: "/outside/other.ts", source: "builtin", scope: "user", origin: "top-level" };
 	const allTools = [
-		{ name: "read", description: "read", parameters: {}, sourceInfo: { path: "/ignored" } },
-		{ name: "bash", description: "bash", parameters: {}, sourceInfo: { path: "/ignored" } },
-		{ name: "subagent", description: "compact", parameters: { type: "object" }, promptSnippet: "compact", sourceInfo: { path: "/ignored" } },
-		{ name: "subagent_capability", description: "cap", parameters: { type: "object" }, sourceInfo: { path: "/ignored" } },
-		{ name: "subagent_wait", description: "wait", parameters: { type: "object" }, sourceInfo: { path: "/ignored" } },
+		{ name: "read", description: "read", parameters: {}, sourceInfo: otherSource },
+		{ name: "bash", description: "bash", parameters: {}, sourceInfo: otherSource },
+		{ name: "subagent", description: "compact", parameters: { type: "object" }, promptSnippet: "compact", sourceInfo: packageSource },
+		{ name: "subagent_capability", description: "cap", parameters: { type: "object" }, sourceInfo: packageSource },
+		{ name: "subagent_wait", description: "wait", parameters: { type: "object" }, sourceInfo: packageSource },
+		{ name: "future_package_tool", description: "future", parameters: { type: "object" }, sourceInfo: packageSource },
 	];
 	const pi = {
 		registerCommand(_name: string, value: RegisteredCommand) { command = value; },
@@ -62,7 +65,7 @@ function sentText(value: unknown): string {
 }
 
 describe("bench-subagent command", () => {
-	it("probes before injecting the v3 specification and measures only model-facing tool fields", async () => {
+	it("probes before injecting the v3 specification and attributes package-owned tools via SourceInfo", async () => {
 		const h = harness();
 		const previous = process.cwd();
 		process.chdir(os.tmpdir());
@@ -77,7 +80,8 @@ describe("bench-subagent command", () => {
 		assert.doesNotMatch(sentText(h.sent[0]), /BENCH_SUBAGENT_V3/);
 		const cleanContext = (h.entries[0]?.data as any).cleanContext;
 		assert.equal(cleanContext.usage.tokens, 1234);
-		assert.deepEqual(cleanContext.surface.piSubagentsActiveToolNames, ["subagent", "subagent_capability"]);
+		assert.deepEqual(cleanContext.surface.piSubagentsActiveToolNames, ["subagent", "subagent_capability", "future_package_tool"]);
+		assert.equal(cleanContext.surface.piSubagentsOwnershipSourceInfoCount, 3);
 		assert.equal(cleanContext.surface.subagentWaitActive, false);
 		assert.equal(cleanContext.surface.piSubagentsModelFacingToolDefinitionBytes > 0, true);
 
@@ -94,13 +98,13 @@ describe("bench-subagent command", () => {
 	it("records capability surface changes without another child run", async () => {
 		const h = harness();
 		await h.command().handler("", h.ctx as never);
-		h.setActiveTools(["read", "bash", "subagent", "subagent_capability", "subagent_wait"]);
+		h.setActiveTools(["read", "bash", "subagent", "subagent_capability", "subagent_wait", "future_package_tool"]);
 		await h.event("tool_execution_end")({ toolName: "subagent_capability", toolCallId: "cap-1", result: {}, isError: false }, h.ctx);
 		const surfaceEntry = h.entries.find((entry) => (entry.data as any)?.phase === "surface");
 		assert.ok(surfaceEntry);
 		assert.equal((surfaceEntry!.data as any).sequence, 1);
 		assert.equal((surfaceEntry!.data as any).surface.subagentWaitActive, true);
-		assert.deepEqual((surfaceEntry!.data as any).surface.piSubagentsActiveToolNames, ["subagent", "subagent_capability", "subagent_wait"]);
+		assert.deepEqual((surfaceEntry!.data as any).surface.piSubagentsActiveToolNames, ["subagent", "subagent_capability", "subagent_wait", "future_package_tool"]);
 	});
 
 	it("refuses to contaminate an existing session", async () => {
@@ -110,16 +114,20 @@ describe("bench-subagent command", () => {
 		assert.equal(h.notifications.some((message) => message.includes("fresh Pi session")), true);
 	});
 
-	it("keeps the benchmark at four subagent calls and five child runs", () => {
+	it("keeps the benchmark small and guards the measurement fixes", () => {
 		const root = new URL("../../", import.meta.url);
 		const config = JSON.parse(fs.readFileSync(fileURLToPath(new URL("benchmarks/benchmark.json", root)), "utf8"));
 		const spec = fs.readFileSync(fileURLToPath(new URL("benchmarks/BENCHMARK.md", root)), "utf8");
 		const start = fs.readFileSync(fileURLToPath(new URL("benchmarks/scripts/start-run.mjs", root)), "utf8");
+		const collect = fs.readFileSync(fileURLToPath(new URL("benchmarks/scripts/collect-session.mjs", root)), "utf8");
 		assert.equal(config.version, 3);
 		assert.equal(config.expectedCoreSubagentCalls, 4);
 		assert.equal(config.expectedChildRuns, 5);
 		assert.doesNotMatch(spec, /BENCH:WORKER|BENCH:REVIEW|BENCH:RESTORE/);
 		assert.match(start, /runs\.run\("advanced", \{ agent: "scout"/);
+		assert.match(start, /runPreserveLeading\("git", \["status", "--porcelain=v1"\]\)/);
 		assert.doesNotMatch(start, /derived\.txt|normalize\.mjs|workflow-seed/);
+		assert.match(collect, /cleanProbeToolFree = probeAssistantEntries\.length === 1 && cleanProbeToolCalls\.length === 0/);
+		assert.match(collect, /cleanPromptTokens = promptTokens\(probeAssistant\.usage\)/);
 	});
 });
