@@ -19,7 +19,7 @@ const benchmarkDir = path.resolve(here, "..");
 const repoRoot = path.resolve(benchmarkDir, "..");
 const config = JSON.parse(fs.readFileSync(path.join(benchmarkDir, "benchmark.json"), "utf8"));
 const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
-if (pkg.name !== "pi-subagents") throw new Error(`Expected pi-subagents repo, got ${pkg.name ?? "unknown"}`);
+if (pkg.name !== "pi-subagents") throw new Error(`Expected pi-subagents package, got ${pkg.name ?? "unknown"}`);
 
 function run(command, args) {
   try {
@@ -35,16 +35,18 @@ function write(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, content);
 }
+function bytes(value) {
+  return Buffer.byteLength(JSON.stringify(value));
+}
 
 const commit = run("git", ["rev-parse", "HEAD"]);
 const shortCommit = commit === "unknown" ? "unknown" : commit.slice(0, 8);
 const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
 const runId = `${stamp}-${shortCommit}-${crypto.randomBytes(2).toString("hex")}`;
 const resultsRoot = expandHome(config.resultsRoot);
-const runsRoot = path.join(resultsRoot, "runs");
-const runDir = path.join(runsRoot, runId);
+const runDir = path.join(resultsRoot, "runs", runId);
 const workspace = path.join(runDir, "workspace");
-fs.mkdirSync(runsRoot, { recursive: true });
+fs.mkdirSync(path.dirname(runDir), { recursive: true });
 fs.mkdirSync(runDir, { recursive: false });
 
 write(path.join(workspace, "facts", "alpha.txt"), "17\n");
@@ -53,25 +55,56 @@ write(path.join(workspace, "facts", "gamma.txt"), "41\n");
 write(path.join(workspace, "facts", "workflow-seed.txt"), "19\n");
 write(path.join(workspace, "facts", "async.txt"), "ready\n");
 write(path.join(workspace, "code", "normalize.mjs"), 'export function normalizeName(value) {\n  return value.trim().toLowerCase().replace(/\\s+/, "-");\n}\n');
-write(path.join(workspace, "code", "test", "normalize.test.mjs"), `import assert from "node:assert/strict";\nimport test from "node:test";\nimport { normalizeName } from "../normalize.mjs";\n\ntest("collapses every whitespace run", () => {\n  assert.equal(normalizeName("  Alpha   Beta   Gamma  "), "alpha-beta-gamma");\n});\n\ntest("handles mixed whitespace", () => {\n  assert.equal(normalizeName("One\\tTwo\\nThree"), "one-two-three");\n});\n`);
+write(path.join(workspace, "code", "test", "normalize.test.mjs"), `import assert from "node:assert/strict";
+import test from "node:test";
+import { normalizeName } from "../normalize.mjs";
 
-const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
+test("collapses every whitespace run", () => {
+  assert.equal(normalizeName("  Alpha   Beta   Gamma  "), "alpha-beta-gamma");
+});
+
+test("handles mixed whitespace", () => {
+  assert.equal(normalizeName("One\\tTwo\\nThree"), "one-two-three");
+});
+`);
+
+const seedPath = path.join(workspace, "facts", "workflow-seed.txt");
+const derivedPath = path.join(workspace, "derived.txt");
+const seedTask = `[BENCH:ADV:SCOUT] Read ${seedPath}. Return exactly BENCH_ADV_SEED=19 and nothing else.`;
+const workflowScript = [
+  `const seed = await runs.run({ key: "seed", agent: "scout", task: ${JSON.stringify(seedTask)} });`,
+  `if (!seed.ok) throw new Error("BENCH advanced seed child failed");`,
+  `const match = String(seed.output ?? "").match(/BENCH_ADV_SEED=(\\d+)/);`,
+  `if (!match) throw new Error("BENCH_ADV_SEED marker missing");`,
+  `const value = Number(match[1]);`,
+  `const target = value * 2;`,
+  `return await runs.run({ key: "write", agent: "worker", task: "[BENCH:ADV:WORKER] Write exactly " + target + "\\n to " + ${JSON.stringify(derivedPath)} + ". Then return exactly BENCH_ADV_WRITE=done and nothing else." });`,
+].join("\n");
+const workflowScriptPath = path.join(runDir, "workflow-script.txt");
+write(workflowScriptPath, `${workflowScript}\n`);
+const workflowScriptSha256 = crypto.createHash("sha256").update(workflowScript).digest("hex");
+
 const minimalSchemaBytes = bytes(BasicSubagentParams);
 const fullSchema = createSubagentParamsSchema();
 const fullSchemaBytes = bytes(fullSchema);
-let unitTestPass = false;
-let unitTestOutput = "";
-try {
-  unitTestOutput = execFileSync(process.execPath, [
-    "--experimental-strip-types",
-    "--import", "./test/support/isolated-temp-root.mjs",
-    "--test", "test/unit/context-surface.test.ts",
-  ], { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  unitTestPass = true;
-} catch (error) {
-  unitTestOutput = `${error.stdout ?? ""}${error.stderr ?? ""}`;
-}
+const minimalSchemaText = JSON.stringify(BasicSubagentParams);
+const staticChecks = {
+  minimalSchemaBounded: minimalSchemaBytes < 3500,
+  minimalRatioBounded: minimalSchemaBytes * 4 < fullSchemaBytes,
+  callsAvailable: minimalSchemaText.includes('"calls"'),
+  advancedFieldsAbsent:
+    !minimalSchemaText.includes('"workflowScript"')
+    && !minimalSchemaText.includes('"mission"')
+    && !minimalSchemaText.includes('"schedule"')
+    && !minimalSchemaText.includes('"acceptance"')
+    && !minimalSchemaText.includes('"watchdog"'),
+  guidanceBounded:
+    Buffer.byteLength(BASIC_SUBAGENT_TOOL_DESCRIPTION) < 500
+    && bytes(SubagentCapabilityParams) < 600
+    && Buffer.byteLength(SUBAGENT_CAPABILITY_DESCRIPTION) < 120,
+};
 const staticMetrics = {
+  source: "shipped-production-contracts",
   minimalSchemaBytes,
   fullSchemaBytes,
   minimalToFullRatio: Number((minimalSchemaBytes / fullSchemaBytes).toFixed(6)),
@@ -81,20 +114,20 @@ const staticMetrics = {
   minimalPromptSnippetBytes: Buffer.byteLength(BASIC_SUBAGENT_PROMPT_SNIPPET),
   capabilitySchemaBytes: bytes(SubagentCapabilityParams),
   capabilityDescriptionBytes: Buffer.byteLength(SUBAGENT_CAPABILITY_DESCRIPTION),
-  unitTestPass,
-  unitTestOutput: unitTestOutput.trim().slice(-4000),
+  checks: staticChecks,
   thresholds: { minimalSchemaBytesMaxExclusive: 3500, minimalToFullRatioMaxExclusive: 0.25 },
+  pass: Object.values(staticChecks).every(Boolean),
 };
-staticMetrics.pass = minimalSchemaBytes < 3500 && minimalSchemaBytes * 4 < fullSchemaBytes && unitTestPass;
 write(path.join(runDir, "static.json"), `${JSON.stringify(staticMetrics, null, 2)}\n`);
 
+const now = Date.now();
 const meta = {
   benchmark: config.name,
   benchmarkVersion: config.version,
   runId,
-  startedAt: new Date().toISOString(),
-  startedAtMs: Date.now(),
-  repoRoot,
+  startedAt: new Date(now).toISOString(),
+  startedAtMs: now,
+  packageRoot: repoRoot,
   packageVersion: pkg.version,
   commit,
   branch: run("git", ["branch", "--show-current"]),
@@ -105,6 +138,19 @@ const meta = {
   hostname: os.hostname(),
   runDir,
   workspace,
+  workflowScriptPath,
+  workflowScriptSha256,
 };
 write(path.join(runDir, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`);
-process.stdout.write(`${JSON.stringify({ runId, runDir, workspace, packageVersion: pkg.version, commit, benchmarkVersion: config.version, staticPass: staticMetrics.pass }, null, 2)}\n`);
+
+process.stdout.write(`${JSON.stringify({
+  runId,
+  runDir,
+  workspace,
+  workflowScriptPath,
+  workflowScriptSha256,
+  packageVersion: pkg.version,
+  commit,
+  benchmarkVersion: config.version,
+  staticPass: staticMetrics.pass,
+}, null, 2)}\n`);
