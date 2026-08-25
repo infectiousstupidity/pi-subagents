@@ -16,32 +16,23 @@ function harness(initialBranch: unknown[] = []) {
 	const sent: unknown[] = [];
 	const entries: Array<{ customType: string; data: unknown }> = [];
 	const notifications: string[] = [];
-	const handlers = new Map<string, (event: unknown, ctx: unknown) => void | Promise<void>>();
+	const handlers = new Map<string, (event: any, ctx: any) => void | Promise<void>>();
 	let branch = initialBranch;
+	let activeTools = ["read", "bash", "subagent", "subagent_capability"];
+	const allTools = [
+		{ name: "read", description: "read", parameters: {}, sourceInfo: { path: "/ignored" } },
+		{ name: "bash", description: "bash", parameters: {}, sourceInfo: { path: "/ignored" } },
+		{ name: "subagent", description: "compact", parameters: { type: "object" }, promptSnippet: "compact", sourceInfo: { path: "/ignored" } },
+		{ name: "subagent_capability", description: "cap", parameters: { type: "object" }, sourceInfo: { path: "/ignored" } },
+		{ name: "subagent_wait", description: "wait", parameters: { type: "object" }, sourceInfo: { path: "/ignored" } },
+	];
 	const pi = {
-		registerCommand(_name: string, value: RegisteredCommand) {
-			command = value;
-		},
-		on(name: string, handler: (event: unknown, ctx: unknown) => void | Promise<void>) {
-			handlers.set(name, handler);
-		},
-		sendUserMessage(value: unknown) {
-			sent.push(value);
-		},
-		appendEntry(customType: string, data: unknown) {
-			entries.push({ customType, data });
-		},
-		getActiveTools() {
-			return ["read", "bash", "subagent", "subagent_capability"];
-		},
-		getAllTools() {
-			return [
-				{ name: "read", description: "read", parameters: {} },
-				{ name: "subagent", description: "subagent", parameters: { type: "object" } },
-				{ name: "subagent_capability", description: "cap", parameters: { type: "object" } },
-				{ name: "subagent_wait", description: "wait", parameters: { type: "object" } },
-			];
-		},
+		registerCommand(_name: string, value: RegisteredCommand) { command = value; },
+		on(name: string, handler: (event: unknown, ctx: unknown) => void | Promise<void>) { handlers.set(name, handler); },
+		sendUserMessage(value: unknown) { sent.push(value); },
+		appendEntry(customType: string, data: unknown) { entries.push({ customType, data }); },
+		getActiveTools() { return activeTools; },
+		getAllTools() { return allTools; },
 	} as unknown as ExtensionAPI;
 	registerBenchmarkCommand(pi);
 	const ctx = {
@@ -59,7 +50,8 @@ function harness(initialBranch: unknown[] = []) {
 		notifications,
 		ctx,
 		setBranch(value: unknown[]) { branch = value; },
-		settled: () => handlers.get("agent_settled")!,
+		setActiveTools(value: string[]) { activeTools = value; },
+		event: (name: string) => handlers.get(name)!,
 	};
 }
 
@@ -70,7 +62,7 @@ function sentText(value: unknown): string {
 }
 
 describe("bench-subagent command", () => {
-	it("runs a tiny probe before injecting the cwd-independent v2 specification", async () => {
+	it("probes before injecting the v3 specification and measures only model-facing tool fields", async () => {
 		const h = harness();
 		const previous = process.cwd();
 		process.chdir(os.tmpdir());
@@ -81,44 +73,34 @@ describe("bench-subagent command", () => {
 		}
 
 		assert.equal(h.sent.length, 1);
-		assert.match(sentText(h.sent[0]), /BENCH_SUBAGENT_PROBE_V2/);
-		assert.doesNotMatch(sentText(h.sent[0]), /BENCH_SUBAGENT_V2/);
-		assert.equal(h.entries[0]?.customType, "pi-subagents-benchmark");
-		const cleanContext = (h.entries[0]?.data as {
-			cleanContext?: {
-				usage?: { tokens?: number };
-				piSubagentsActiveToolNames?: string[];
-				piSubagentsActiveToolDefinitionBytes?: number;
-				subagentWaitActive?: boolean;
-			};
-		}).cleanContext;
-		assert.equal(cleanContext?.usage?.tokens, 1234);
-		assert.deepEqual(cleanContext?.piSubagentsActiveToolNames, ["subagent", "subagent_capability"]);
-		assert.equal((cleanContext?.piSubagentsActiveToolDefinitionBytes ?? 0) > 0, true);
-		assert.equal(cleanContext?.subagentWaitActive, false);
+		assert.match(sentText(h.sent[0]), /BENCH_SUBAGENT_PROBE_V3/);
+		assert.doesNotMatch(sentText(h.sent[0]), /BENCH_SUBAGENT_V3/);
+		const cleanContext = (h.entries[0]?.data as any).cleanContext;
+		assert.equal(cleanContext.usage.tokens, 1234);
+		assert.deepEqual(cleanContext.surface.piSubagentsActiveToolNames, ["subagent", "subagent_capability"]);
+		assert.equal(cleanContext.surface.subagentWaitActive, false);
+		assert.equal(cleanContext.surface.piSubagentsModelFacingToolDefinitionBytes > 0, true);
 
 		h.setBranch([
-			{ type: "message", message: { role: "user", content: "BENCH_SUBAGENT_PROBE_V2\nReply exactly BENCH_PROBE_OK and do not call tools." } },
+			{ type: "message", message: { role: "user", content: "BENCH_SUBAGENT_PROBE_V3\nReply exactly BENCH_PROBE_OK and do not call tools." } },
 			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "BENCH_PROBE_OK" }] } },
 		]);
-		await h.settled()({}, h.ctx as never);
-
+		await h.event("agent_settled")({}, h.ctx);
 		assert.equal(h.sent.length, 2);
-		const spec = sentText(h.sent[1]);
-		assert.match(spec, /BENCH_SUBAGENT_V2/);
-		assert.match(spec, /Resolved package root:/);
-		assert.doesNotMatch(spec, /node --experimental-strip-types benchmarks\/scripts\/start-run\.mjs/);
-		assert.match(spec, /benchmarks\/scripts\/start-run\.mjs/);
+		assert.match(sentText(h.sent[1]), /BENCH_SUBAGENT_V3/);
+		assert.match(sentText(h.sent[1]), /Resolved package root:/);
 	});
 
-	it("does not inject the specification twice after the v2 marker exists", async () => {
-		const h = harness([
-			{ type: "message", message: { role: "user", content: "BENCH_SUBAGENT_PROBE_V2" } },
-			{ type: "message", message: { role: "assistant", content: "BENCH_PROBE_OK" } },
-			{ type: "message", message: { role: "user", content: "BENCH_SUBAGENT_V2" } },
-		]);
-		await h.settled()({}, h.ctx as never);
-		assert.equal(h.sent.length, 0);
+	it("records capability surface changes without another child run", async () => {
+		const h = harness();
+		await h.command().handler("", h.ctx as never);
+		h.setActiveTools(["read", "bash", "subagent", "subagent_capability", "subagent_wait"]);
+		await h.event("tool_execution_end")({ toolName: "subagent_capability", toolCallId: "cap-1", result: {}, isError: false }, h.ctx);
+		const surfaceEntry = h.entries.find((entry) => (entry.data as any)?.phase === "surface");
+		assert.ok(surfaceEntry);
+		assert.equal((surfaceEntry!.data as any).sequence, 1);
+		assert.equal((surfaceEntry!.data as any).surface.subagentWaitActive, true);
+		assert.deepEqual((surfaceEntry!.data as any).surface.piSubagentsActiveToolNames, ["subagent", "subagent_capability", "subagent_wait"]);
 	});
 
 	it("refuses to contaminate an existing session", async () => {
@@ -128,11 +110,16 @@ describe("bench-subagent command", () => {
 		assert.equal(h.notifications.some((message) => message.includes("fresh Pi session")), true);
 	});
 
-	it("generates workflow children with runs.run(key, params)", () => {
-		const scriptPath = fileURLToPath(new URL("../../benchmarks/scripts/start-run.mjs", import.meta.url));
-		const source = fs.readFileSync(scriptPath, "utf8");
-		assert.equal(source.includes('runs.run("seed", { agent:'), true);
-		assert.equal(source.includes('runs.run("write", { agent:'), true);
-		assert.equal(source.includes("runs.run({ key:"), false);
+	it("keeps the benchmark at four subagent calls and five child runs", () => {
+		const root = new URL("../../", import.meta.url);
+		const config = JSON.parse(fs.readFileSync(fileURLToPath(new URL("benchmarks/benchmark.json", root)), "utf8"));
+		const spec = fs.readFileSync(fileURLToPath(new URL("benchmarks/BENCHMARK.md", root)), "utf8");
+		const start = fs.readFileSync(fileURLToPath(new URL("benchmarks/scripts/start-run.mjs", root)), "utf8");
+		assert.equal(config.version, 3);
+		assert.equal(config.expectedCoreSubagentCalls, 4);
+		assert.equal(config.expectedChildRuns, 5);
+		assert.doesNotMatch(spec, /BENCH:WORKER|BENCH:REVIEW|BENCH:RESTORE/);
+		assert.match(start, /runs\.run\("advanced", \{ agent: "scout"/);
+		assert.doesNotMatch(start, /derived\.txt|normalize\.mjs|workflow-seed/);
 	});
 });
