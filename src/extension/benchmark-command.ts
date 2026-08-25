@@ -23,7 +23,6 @@ function portablePath(value: string): string {
 
 function resolveBenchmarkSpec(source: string): string {
 	const root = portablePath(packageRoot);
-	const specPath = portablePath(benchmarkPath);
 	return source
 		.replace(
 			"node --experimental-strip-types benchmarks/scripts/start-run.mjs",
@@ -36,10 +35,6 @@ function resolveBenchmarkSpec(source: string): string {
 		.replace(
 			"node benchmarks/scripts/finalize-run.mjs <runId>",
 			`node "${root}/benchmarks/scripts/finalize-run.mjs" <runId>`,
-		)
-		.replace(
-			"this benchmark specification embedded in the saved session.",
-			`this benchmark specification embedded in the saved session (source: \`${specPath}\`).`,
 		);
 }
 
