@@ -1,24 +1,24 @@
-# pi-subagents benchmark v2
+# pi-subagents benchmark v3
 
-Purpose: detect regressions in the fork's **clean starting context, compact tool surface, common delegation paths, progressive disclosure, correctness, and orchestration discipline**.
+Purpose: detect regressions in the fork's **startup context tax, compact delegation, progressive disclosure, and async/wait path**.
 
-This benchmark is intentionally boring. Follow it exactly. Do not diagnose failures during the measured core.
+This benchmark intentionally does not test coding quality, filesystem editing, acceptance machinery, reviewer quality, or general agent intelligence. Those belong in normal tests, not this benchmark.
 
 ## Rules
 
-- `/bench-subagent` must be run in a fresh Pi session. The command performs a tiny clean-context probe before this specification is injected.
+- Run `/bench-subagent` in a fresh Pi session. The command performs a tiny clean-context probe before this specification is injected.
 - The Pi session may run from any cwd; `/bench-subagent` resolves the installed package root.
-- Phase 0 creates a disposable workspace under `~/.pi/benchmarks/pi-subagents/`.
-- Every normally synchronous scenario explicitly uses `async: false`. Only Phase 5 uses `async: true`.
-- Use `context: "fresh"` for benchmark children.
+- Use `context: "fresh"` for every child.
+- Every synchronous scenario explicitly uses `async: false`. Only the async scenario uses `async: true`.
 - The parent orchestrates only. Do not solve child tasks yourself.
-- **Fail forward:** if a benchmark child/tool fails, record the failure and continue to the next phase. Do not retry, inspect, repair, or debug during the measured core.
-- Do not load advanced controls before Phase 4.
-- Use the exact markers below. The collector uses the saved Pi JSONL session as evidence.
+- **Fail forward:** if a benchmark call fails, continue to the next phase. Do not retry, inspect, repair, or diagnose during the measured core.
+- Do not load advanced controls before Phase 3.
+- Use the exact markers and generated workflowScript below. The collector uses the saved Pi JSONL session as evidence.
+- The intended budget is **4 parent `subagent` calls and 5 child runs total**.
 
-Generated data belongs under `~/.pi/benchmarks/pi-subagents/`, not in the repository.
+Generated results belong under `~/.pi/benchmarks/pi-subagents/`, not in the repository.
 
-## Phase 0 — initialize + production static checks
+## Phase 0 — initialize + static context checks
 
 Run exactly:
 
@@ -26,11 +26,11 @@ Run exactly:
 node --experimental-strip-types benchmarks/scripts/start-run.mjs
 ```
 
-Keep the returned `runId`, `runDir`, `workspace`, and `workflowScriptPath`.
+Keep the returned `runId` and `workflowScript`. Do not rewrite the workflowScript.
 
-The script checks only shipped production contracts. Repository unit tests/CI are deliberately outside this benchmark. It also records Git status/diff metadata. A dirty package checkout does not invalidate functional checks, but the finalized run is WARN and must not be treated as a clean baseline.
+The script measures the shipped compact/full contracts and records repository provenance. `package-lock.json`, docs, tests, README, and changelog dirtiness are recorded but do not invalidate a baseline because they do not change the runtime being benchmarked.
 
-## Phase 1 — compact single child
+## Phase 1 — compact single
 
 Use compact `subagent` exactly once:
 
@@ -40,111 +40,10 @@ Use compact `subagent` exactly once:
 - task:
 
 ```text
-[BENCH:SINGLE] Read <workspace>/facts/alpha.txt. Return exactly BENCH_SINGLE=17 and nothing else.
+[BENCH:SINGLE] Return exactly BENCH_SINGLE=ok and nothing else.
 ```
 
-If it fails, continue without retrying.
-
-## Phase 2 — compact parallel fanout
-
-Use one compact `subagent` call with:
-
-- `context: "fresh"`
-- `async: false`
-- `calls[]` with exactly three `scout` children:
-
-```text
-[BENCH:PARALLEL:A] Read <workspace>/facts/alpha.txt. Return exactly BENCH_PARALLEL_A=17 and nothing else.
-[BENCH:PARALLEL:B] Read <workspace>/facts/beta.txt. Return exactly BENCH_PARALLEL_B=23 and nothing else.
-[BENCH:PARALLEL:C] Read <workspace>/facts/gamma.txt. Return exactly BENCH_PARALLEL_C=41 and nothing else.
-```
-
-If it fails, continue without retrying.
-
-## Phase 3 — compact worker edit
-
-Use compact `subagent` exactly once:
-
-- `agent: "worker"`
-- `context: "fresh"`
-- `async: false`
-- task:
-
-```text
-[BENCH:WORKER] In <workspace>/code, fix normalize.mjs so all tests in test/normalize.test.mjs pass. Do not modify the test file. Run the tests before finishing. Make the smallest correct change.
-```
-
-Then run exactly:
-
-```bash
-node --test <workspace>/code/test/normalize.test.mjs
-```
-
-Do not repair the code in the parent if it fails.
-
-## Phase 4 — exact advanced workflow, then unload
-
-Load advanced controls exactly once:
-
-```text
-subagent_capability({ mode: "advanced" })
-```
-
-Read `<workflowScriptPath>`. Pass its contents **verbatim** as `workflowScript` to one advanced `subagent` call with:
-
-- `context: "fresh"`
-- `async: false`
-
-Do not rewrite, regenerate, or "improve" the script.
-
-The generated script uses the current keyed workflow contract `runs.run(key, params)` and performs the sequential scout → worker dependency. It expects `<workspace>/derived.txt` to become exactly:
-
-```text
-38
-```
-
-After the workflow returns, always restore compact mode:
-
-```text
-subagent_capability({ mode: "minimal" })
-```
-
-If the workflow fails, do not investigate it during the core.
-
-## Phase 5 — intentional async + wait, then unload wait
-
-Launch compact `subagent`:
-
-- `agent: "scout"`
-- `context: "fresh"`
-- `async: true`
-- task:
-
-```text
-[BENCH:ASYNC] Read <workspace>/facts/async.txt. Return exactly BENCH_ASYNC=ready and nothing else.
-```
-
-Then load only wait:
-
-```text
-subagent_capability({ mode: "wait" })
-```
-
-Call:
-
-```text
-subagent_wait({ all: true, timeoutMs: 120000 })
-```
-
-Then always restore compact mode:
-
-```text
-subagent_capability({ mode: "minimal" })
-```
-
-Do not inspect the async run unless the benchmark specification explicitly says to.
-
-## Phase 6 — compact surface still works
+## Phase 2 — compact parallel calls[]
 
 Use one compact `subagent` call with:
 
@@ -153,13 +52,68 @@ Use one compact `subagent` call with:
 - exactly two `scout` children in `calls[]`:
 
 ```text
-[BENCH:RESTORE:A] Read <workspace>/facts/alpha.txt. Return exactly BENCH_RESTORE_A=17 and nothing else.
-[BENCH:RESTORE:B] Read <workspace>/facts/beta.txt. Return exactly BENCH_RESTORE_B=23 and nothing else.
+[BENCH:PARALLEL:A] Return exactly BENCH_PARALLEL_A=ok and nothing else.
+[BENCH:PARALLEL:B] Return exactly BENCH_PARALLEL_B=ok and nothing else.
 ```
 
-Do not load advanced/wait again.
+## Phase 3 — advanced load/run/restore
 
-## Phase 7 — close measured core + collect
+Load advanced controls exactly once:
+
+```text
+subagent_capability({ mode: "advanced" })
+```
+
+Use one advanced `subagent` call with:
+
+- `context: "fresh"`
+- `async: false`
+- `workflowScript`: the exact `workflowScript` returned by Phase 0
+
+Do not rewrite or regenerate the script.
+
+Then always restore minimal mode:
+
+```text
+subagent_capability({ mode: "minimal" })
+```
+
+The benchmark extension records the actual active model-facing tool surface after both capability calls. No extra child run is needed to prove restoration.
+
+## Phase 4 — async + wait + final restore
+
+Launch compact `subagent` exactly once:
+
+- `agent: "scout"`
+- `context: "fresh"`
+- `async: true`
+- task:
+
+```text
+[BENCH:ASYNC] Return exactly BENCH_ASYNC=ready and nothing else.
+```
+
+Load only wait:
+
+```text
+subagent_capability({ mode: "wait" })
+```
+
+Call exactly:
+
+```text
+subagent_wait({ all: true, timeoutMs: 120000 })
+```
+
+Then restore minimal mode:
+
+```text
+subagent_capability({ mode: "minimal" })
+```
+
+The benchmark extension records the wait-loaded and final-minimal tool surfaces directly.
+
+## Phase 5 — collect measured core
 
 Run exactly:
 
@@ -167,52 +121,22 @@ Run exactly:
 node benchmarks/scripts/collect-session.mjs <runId>
 ```
 
-The collector records the core end before analysis. It must produce `metrics.json` and print the exact parent session path.
+Do not diagnose failures before collection. The collector checks:
 
-Everything after core-end is excluded from measured core token/time metrics.
+- clean probe,
+- compact/full static surface,
+- single delegation,
+- parallel `calls[]`,
+- advanced workflow execution,
+- advanced → minimal restoration,
+- async + wait,
+- final minimal restoration,
+- exact capability sequence,
+- unexpected/retry subagent calls.
 
-## Phase 8 — two independent reviewers
+Parent tokens, child tokens, and wall time are recorded only as informational trend data.
 
-Use one final compact `subagent` call with:
-
-- `context: "fresh"`
-- `async: false`
-- two parallel `reviewer` children.
-
-Give both reviewers:
-
-- the saved parent Pi session path,
-- `<runDir>/metrics.json`,
-- this benchmark specification embedded in the saved session.
-
-Reviewer 1:
-
-```text
-[BENCH:REVIEW:EFFICIENCY] Audit benchmark orchestration efficiency and progressive-disclosure discipline only. Flag unnecessary capability loading, retries, duplicate work, parent-side task solving, diagnosis during the measured core, or avoidable tool calls. Return exactly:
-VERDICT: PASS|WARN|FAIL
-FINDINGS:
-- ...
-```
-
-Reviewer 2:
-
-```text
-[BENCH:REVIEW:CORRECTNESS] Audit whether the benchmark followed its specification and whether session evidence supports the deterministic results. Flag skipped phases, cheating, task drift, hidden retries, rewritten workflowScript, or suspicious success claims. Return exactly:
-VERDICT: PASS|WARN|FAIL
-FINDINGS:
-- ...
-```
-
-Write their outputs verbatim to:
-
-```text
-<runDir>/review-efficiency.md
-<runDir>/review-correctness.md
-```
-
-The finalizer accepts the verdict line even if a reviewer wraps it in ordinary Markdown emphasis.
-
-## Phase 9 — finalize
+## Phase 6 — finalize
 
 Run exactly:
 
@@ -222,38 +146,44 @@ node benchmarks/scripts/finalize-run.mjs <runId>
 
 Finish by reporting only:
 
-- run id,
-- status,
+- run id and status,
 - scenarios passed/total,
-- clean probe usage,
-- clean pre-request snapshot,
-- pi-subagents-only active tool-definition bytes,
+- clean probe tokens,
+- pi-subagents model-facing tool-definition bytes,
 - minimal/full schema bytes and ratio,
-- core parent tokens,
-- nested subagent tokens,
-- core wall time,
-- reviewer verdicts,
-- `RESULTS.md`,
-- this run's `report.md`.
+- capability sequence and extra subagent calls,
+- parent tokens, nested tokens, and wall time as informational values,
+- relevant dirty-worktree status,
+- `RESULTS.md` and this run's `report.md`.
 
 ## Regression policy
 
 Hard failure:
 
 - any deterministic scenario fails,
-- clean probe does not return exactly `BENCH_PROBE_OK`,
+- clean probe is not exactly `BENCH_PROBE_OK`,
 - minimal schema is >= 3,500 bytes,
 - minimal schema is >= 25% of full schema,
-- compact `calls[]` is unavailable,
-- advanced workflowScript differs from the generated exact script,
-- benchmark cannot identify its saved parent session.
+- `calls[]` is unavailable,
+- `subagent_wait` is active in the initial minimal surface,
+- generated advanced workflowScript is changed,
+- capability sequence is not exactly `advanced → minimal → wait → minimal`,
+- the core uses more or fewer than 4 parent `subagent` calls,
+- wait is not called exactly once,
+- the parent session cannot be identified.
 
 Warning:
 
-- package checkout is dirty; the run is diagnostic, not a clean baseline,
-- capability sequence is not exactly `advanced → minimal → wait → minimal`,
-- core contains extra subagent calls/retries,
-- either reviewer returns WARN,
-- clean probe usage or core usage materially increases versus a comparable successful v2 run.
+- runtime/benchmark source files are dirty,
+- minimal schema bytes increase by >5% versus the previous comparable clean PASS,
+- initial pi-subagents model-facing tool-definition bytes increase by >5% versus the previous comparable clean PASS.
 
-Only compare token/time numbers when benchmark version, Pi version, provider, and model match. Failed/incomplete runs are never selected automatically as performance baselines. Static schema metrics remain comparable across environments.
+Informational only — never changes status:
+
+- clean probe token variation,
+- parent token variation,
+- nested child token variation,
+- wall-time variation,
+- dirtiness limited to package-lock, docs, tests, README, changelog, or .gitignore.
+
+Only compare performance/context deltas when benchmark version, Pi version, provider, and model match. Static schema limits remain absolute.
