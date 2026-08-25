@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerBenchmarkCommand } from "../../src/extension/benchmark-command.ts";
@@ -35,8 +37,9 @@ function harness(initialBranch: unknown[] = []) {
 		getAllTools() {
 			return [
 				{ name: "read", description: "read", parameters: {} },
-				{ name: "subagent", description: "subagent", parameters: {} },
-				{ name: "subagent_capability", description: "cap", parameters: {} },
+				{ name: "subagent", description: "subagent", parameters: { type: "object" } },
+				{ name: "subagent_capability", description: "cap", parameters: { type: "object" } },
+				{ name: "subagent_wait", description: "wait", parameters: { type: "object" } },
 			];
 		},
 	} as unknown as ExtensionAPI;
@@ -81,7 +84,18 @@ describe("bench-subagent command", () => {
 		assert.match(sentText(h.sent[0]), /BENCH_SUBAGENT_PROBE_V2/);
 		assert.doesNotMatch(sentText(h.sent[0]), /BENCH_SUBAGENT_V2/);
 		assert.equal(h.entries[0]?.customType, "pi-subagents-benchmark");
-		assert.equal((h.entries[0]?.data as { cleanContext?: { usage?: { tokens?: number } } }).cleanContext?.usage?.tokens, 1234);
+		const cleanContext = (h.entries[0]?.data as {
+			cleanContext?: {
+				usage?: { tokens?: number };
+				piSubagentsActiveToolNames?: string[];
+				piSubagentsActiveToolDefinitionBytes?: number;
+				subagentWaitActive?: boolean;
+			};
+		}).cleanContext;
+		assert.equal(cleanContext?.usage?.tokens, 1234);
+		assert.deepEqual(cleanContext?.piSubagentsActiveToolNames, ["subagent", "subagent_capability"]);
+		assert.equal((cleanContext?.piSubagentsActiveToolDefinitionBytes ?? 0) > 0, true);
+		assert.equal(cleanContext?.subagentWaitActive, false);
 
 		h.setBranch([
 			{ type: "message", message: { role: "user", content: "BENCH_SUBAGENT_PROBE_V2\nReply exactly BENCH_PROBE_OK and do not call tools." } },
@@ -112,5 +126,13 @@ describe("bench-subagent command", () => {
 		await h.command().handler("", h.ctx as never);
 		assert.equal(h.sent.length, 0);
 		assert.equal(h.notifications.some((message) => message.includes("fresh Pi session")), true);
+	});
+
+	it("generates workflow children with runs.run(key, params)", () => {
+		const scriptPath = fileURLToPath(new URL("../../benchmarks/scripts/start-run.mjs", import.meta.url));
+		const source = fs.readFileSync(scriptPath, "utf8");
+		assert.match(source, /runs\.run\(\\"seed\\", \{ agent:/);
+		assert.match(source, /runs\.run\(\\"write\\", \{ agent:/);
+		assert.doesNotMatch(source, /runs\.run\(\{ key:/);
 	});
 });
