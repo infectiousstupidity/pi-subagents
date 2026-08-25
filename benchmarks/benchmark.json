@@ -1,5 +1,5 @@
 {
   "name": "pi-subagents-agent-benchmark",
-  "version": 1,
+  "version": 2,
   "resultsRoot": "~/.pi/benchmarks/pi-subagents"
 }
