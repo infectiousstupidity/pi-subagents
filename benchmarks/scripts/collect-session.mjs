@@ -2,7 +2,6 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const runId = process.argv[2];
@@ -27,12 +26,6 @@ function walk(dir, out = []) {
   }
   return out;
 }
-function entryMs(entry) {
-  const direct = Date.parse(entry?.timestamp ?? "");
-  if (Number.isFinite(direct)) return direct;
-  const nested = Number(entry?.message?.timestamp ?? NaN);
-  return Number.isFinite(nested) ? nested : NaN;
-}
 function messageText(message) {
   const content = message?.content;
   if (typeof content === "string") return content;
@@ -56,9 +49,6 @@ function addUsage(target, usage) {
   const value = normalizedUsage(usage);
   for (const key of Object.keys(target)) target[key] += value[key];
 }
-function includesAll(text, values) {
-  return values.every((value) => text.includes(value));
-}
 function collectJsonlPaths(value, out = new Set()) {
   if (typeof value === "string") {
     if (value.toLowerCase().endsWith(".jsonl") && fs.existsSync(value)) out.add(path.resolve(value));
@@ -67,9 +57,7 @@ function collectJsonlPaths(value, out = new Set()) {
         const parsed = JSON.parse(fs.readFileSync(value, "utf8"));
         if (Array.isArray(parsed?.entries)) {
           for (const entry of parsed.entries) {
-            if (entry?.source === "session" && typeof entry.path === "string" && fs.existsSync(entry.path)) {
-              out.add(path.resolve(entry.path));
-            }
+            if (entry?.source === "session" && typeof entry.path === "string" && fs.existsSync(entry.path)) out.add(path.resolve(entry.path));
           }
         }
       } catch {}
@@ -90,14 +78,22 @@ function usageFromJsonl(file) {
     for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean)) {
       let record;
       try { record = JSON.parse(line); } catch { continue; }
-      if (record?.type === "message" && record?.message?.role === "assistant") {
-        addUsage(total, record.message.usage);
-        continue;
-      }
-      if (record?.role === "assistant" && record?.usage) addUsage(total, record.usage);
+      if (record?.type === "message" && record?.message?.role === "assistant") addUsage(total, record.message.usage);
+      else if (record?.role === "assistant" && record?.usage) addUsage(total, record.usage);
     }
   } catch {}
   return total;
+}
+function sameStrings(a, b) {
+  return JSON.stringify([...(a ?? [])].sort()) === JSON.stringify([...(b ?? [])].sort());
+}
+function sameMinimalSurface(surface, initial) {
+  if (!surface || !initial) return false;
+  return !surface.subagentWaitActive
+    && sameStrings(surface.piSubagentsActiveToolNames, initial.piSubagentsActiveToolNames)
+    && surface.piSubagentsModelFacingToolDefinitionBytes === initial.piSubagentsModelFacingToolDefinitionBytes
+    && surface.piSubagentsModelFacingBytesByTool?.subagent === initial.piSubagentsModelFacingBytesByTool?.subagent
+    && surface.piSubagentsModelFacingBytesByTool?.subagent_capability === initial.piSubagentsModelFacingBytesByTool?.subagent_capability;
 }
 
 const sessionRoot = path.join(os.homedir(), ".pi", "agent", "sessions");
@@ -106,41 +102,35 @@ for (const file of walk(sessionRoot)) {
   const stat = fs.statSync(file);
   if (stat.mtimeMs < meta.startedAtMs - 5 * 60_000) continue;
   const text = fs.readFileSync(file, "utf8");
-  if (text.includes("BENCH_SUBAGENT_V2") && text.includes(runId)) candidates.push(file);
+  if (text.includes("BENCH_SUBAGENT_V3") && text.includes(runId)) candidates.push(file);
 }
-if (candidates.length !== 1) {
-  throw new Error(`Expected exactly one parent benchmark session, found ${candidates.length}: ${candidates.join(", ")}`);
-}
+if (candidates.length !== 1) throw new Error(`Expected exactly one parent benchmark session, found ${candidates.length}: ${candidates.join(", ")}`);
+
 const sessionPath = path.resolve(candidates[0]);
 const entries = fs.readFileSync(sessionPath, "utf8").split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
-
 let probeUserIndex = -1;
 let benchmarkUserIndex = -1;
 let cleanContext = null;
+const surfaceSnapshots = [];
 for (let i = 0; i < entries.length; i += 1) {
   const entry = entries[i];
   if (entry.type === "message" && entry.message?.role === "user") {
     const text = messageText(entry.message);
-    if (text.includes("BENCH_SUBAGENT_PROBE_V2")) probeUserIndex = i;
-    if (text.includes("BENCH_SUBAGENT_V2")) benchmarkUserIndex = i;
+    if (text.includes("BENCH_SUBAGENT_PROBE_V3")) probeUserIndex = i;
+    if (text.includes("BENCH_SUBAGENT_V3")) benchmarkUserIndex = i;
   }
-  if (entry.type === "custom" && entry.customType === "pi-subagents-benchmark" && entry.data?.version === 2 && entry.data?.cleanContext) {
-    cleanContext = entry.data.cleanContext;
+  if (entry.type === "custom" && entry.customType === "pi-subagents-benchmark" && entry.data?.version === 3) {
+    if (entry.data.cleanContext) cleanContext = entry.data.cleanContext;
+    if (entry.data.phase === "surface" && entry.data.surface) surfaceSnapshots.push(entry.data.surface);
   }
 }
 if (probeUserIndex < 0 || benchmarkUserIndex < 0) throw new Error("Benchmark probe/spec markers are missing from the parent session.");
-
-const terminalIndex = entries.findIndex((entry, index) =>
-  index > benchmarkUserIndex && Number.isFinite(entryMs(entry)) && entryMs(entry) > meta.coreEndedAtMs + 1000
-);
-const coreEndIndex = terminalIndex >= 0 ? terminalIndex : entries.length;
 
 const assistantEntries = [];
 const toolCalls = [];
 const toolResults = new Map();
 const parentUsage = usageZero();
-
-for (let i = 0; i < coreEndIndex; i += 1) {
+for (let i = 0; i < entries.length; i += 1) {
   const entry = entries[i];
   if (entry.type !== "message") continue;
   const message = entry.message;
@@ -149,9 +139,7 @@ for (let i = 0; i < coreEndIndex; i += 1) {
     if (i > benchmarkUserIndex) addUsage(parentUsage, message.usage);
     if (i > benchmarkUserIndex) {
       for (const part of message.content ?? []) {
-        if (part?.type === "toolCall") {
-          toolCalls.push({ index: i, id: part.id, name: part.name, args: part.arguments ?? {}, timestamp: entry.timestamp });
-        }
+        if (part?.type === "toolCall") toolCalls.push({ index: i, id: part.id, name: part.name, args: part.arguments ?? {} });
       }
     }
   }
@@ -164,7 +152,7 @@ const cleanProbeText = messageText(probeAssistant).trim();
 const cleanProbeUsage = normalizedUsage(probeAssistant.usage);
 
 const callText = (call) => JSON.stringify(call.args ?? {});
-const resultMessage = (call) => toolResults.get(call.id);
+const resultMessage = (call) => toolResults.get(call?.id);
 const resultText = (call) => messageText(resultMessage(call));
 const findCall = (predicate) => toolCalls.find(predicate);
 const findCalls = (predicate) => toolCalls.filter(predicate);
@@ -172,71 +160,58 @@ const markerCall = (marker) => findCall((call) => call.name === "subagent" && ca
 
 const single = markerCall("[BENCH:SINGLE]");
 const parallel = markerCall("[BENCH:PARALLEL:A]");
-const worker = markerCall("[BENCH:WORKER]");
-const advanced = markerCall("[BENCH:ADV:SCOUT]");
+const advanced = markerCall("[BENCH:ADVANCED]");
 const asyncCall = markerCall("[BENCH:ASYNC]");
-const restore = markerCall("[BENCH:RESTORE:A]");
 const waitCall = findCall((call) => call.name === "subagent_wait");
-
-let workerTestsPass = false;
-let workerTestOutput = "";
-try {
-  workerTestOutput = execFileSync(process.execPath, ["--test", path.join(meta.workspace, "code", "test", "normalize.test.mjs")], { encoding: "utf8" });
-  workerTestsPass = true;
-} catch (error) {
-  workerTestOutput = `${error.stdout ?? ""}${error.stderr ?? ""}`;
-}
-
-const derivedPath = path.join(meta.workspace, "derived.txt");
-const derivedExact = fs.existsSync(derivedPath) && fs.readFileSync(derivedPath, "utf8") === "38\n";
-const expectedWorkflowScript = fs.readFileSync(meta.workflowScriptPath, "utf8").trim();
-
 const capabilityCalls = findCalls((call) => call.name === "subagent_capability");
 const capabilitySequence = capabilityCalls.map((call) => call.args?.mode).filter(Boolean);
 const expectedCapabilitySequence = ["advanced", "minimal", "wait", "minimal"];
 const capabilityDiscipline = JSON.stringify(capabilitySequence) === JSON.stringify(expectedCapabilitySequence);
+const subagentCalls = findCalls((call) => call.name === "subagent");
+const expectedCoreSubagentCalls = Number(meta.expectedCoreSubagentCalls ?? config.expectedCoreSubagentCalls ?? 4);
+const extraSubagentCalls = Math.max(0, subagentCalls.length - expectedCoreSubagentCalls);
+const disciplinePass = capabilityDiscipline && subagentCalls.length === expectedCoreSubagentCalls && findCalls((call) => call.name === "subagent_wait").length === 1;
+
+const initialSurface = cleanContext?.surface ?? null;
+const [advancedSurface, restoredSurface, waitSurface, finalSurface] = surfaceSnapshots;
+const advancedSurfacePass = Boolean(
+  advancedSurface
+  && !advancedSurface.subagentWaitActive
+  && advancedSurface.piSubagentsActiveToolNames?.includes("subagent")
+  && advancedSurface.piSubagentsActiveToolNames?.includes("subagent_capability")
+  && !advancedSurface.piSubagentsActiveToolNames?.includes("subagent_wait")
+  && Number(advancedSurface.piSubagentsModelFacingBytesByTool?.subagent ?? 0) > Number(initialSurface?.piSubagentsModelFacingBytesByTool?.subagent ?? Infinity)
+);
+const restoredSurfacePass = sameMinimalSurface(restoredSurface, initialSurface);
+const waitSurfacePass = Boolean(
+  waitSurface
+  && waitSurface.subagentWaitActive
+  && waitSurface.piSubagentsActiveToolNames?.includes("subagent_wait")
+  && waitSurface.piSubagentsModelFacingBytesByTool?.subagent === initialSurface?.piSubagentsModelFacingBytesByTool?.subagent
+);
+const finalMinimalPass = sameMinimalSurface(finalSurface, initialSurface);
 
 const staticMetrics = JSON.parse(fs.readFileSync(path.join(runDir, "static.json"), "utf8"));
-const sessionEvidence = JSON.stringify(entries);
+const expectedWorkflowScript = String(meta.workflowScript ?? "").trim();
 const scenarios = {
   cleanProbe: cleanProbeText === "BENCH_PROBE_OK",
-  staticSurface: Boolean(staticMetrics.pass),
-  single: Boolean(single
-    && single.args.async === false
-    && !single.args.workflowScript
-    && !single.args.calls
-    && resultText(single).includes("BENCH_SINGLE=17")),
-  parallel: Boolean(parallel
-    && parallel.args.async === false
-    && Array.isArray(parallel.args.calls)
-    && parallel.args.calls.length === 3
-    && includesAll(resultText(parallel), ["BENCH_PARALLEL_A=17", "BENCH_PARALLEL_B=23", "BENCH_PARALLEL_C=41"])),
-  worker: Boolean(worker && worker.args.async === false && workerTestsPass && !worker.args.workflowScript),
-  advanced: Boolean(advanced
-    && advanced.args.async === false
-    && typeof advanced.args.workflowScript === "string"
-    && advanced.args.workflowScript.trim() === expectedWorkflowScript
-    && derivedExact),
-  asyncWait: Boolean(asyncCall
-    && asyncCall.args.async === true
-    && waitCall
-    && sessionEvidence.includes("BENCH_ASYNC=ready")),
-  restore: Boolean(restore
-    && restore.args.async === false
-    && Array.isArray(restore.args.calls)
-    && includesAll(resultText(restore), ["BENCH_RESTORE_A=17", "BENCH_RESTORE_B=23"])),
+  staticSurface: Boolean(staticMetrics.pass && initialSurface && !initialSurface.subagentWaitActive),
+  single: Boolean(single && single.args.async === false && !single.args.workflowScript && !single.args.calls && resultText(single).includes("BENCH_SINGLE=ok")),
+  parallel: Boolean(parallel && parallel.args.async === false && Array.isArray(parallel.args.calls) && parallel.args.calls.length === 2 && resultText(parallel).includes("BENCH_PARALLEL_A=ok") && resultText(parallel).includes("BENCH_PARALLEL_B=ok")),
+  advancedRun: Boolean(advanced && advanced.args.async === false && advanced.args.workflowScript?.trim() === expectedWorkflowScript && resultText(advanced).includes("BENCH_ADVANCED=ok") && advancedSurfacePass),
+  advancedRestore: restoredSurfacePass,
+  asyncWait: Boolean(asyncCall && asyncCall.args.async === true && waitCall && resultText(waitCall).includes("BENCH_ASYNC=ready") && waitSurfacePass),
+  finalMinimal: finalMinimalPass,
 };
 
 const syncNestedUsage = usageZero();
 let syncUsageSources = 0;
-for (const call of findCalls((candidate) => candidate.name === "subagent" && candidate.args?.async !== true)) {
+for (const call of subagentCalls.filter((candidate) => candidate.args?.async !== true)) {
   const details = resultMessage(call)?.details;
   if (details?.totalChildUsage) {
     addUsage(syncNestedUsage, details.totalChildUsage);
     syncUsageSources += 1;
-    continue;
-  }
-  if (Array.isArray(details?.results)) {
+  } else if (Array.isArray(details?.results)) {
     for (const child of details.results) {
       if (child?.usage) {
         addUsage(syncNestedUsage, child.usage);
@@ -245,24 +220,17 @@ for (const call of findCalls((candidate) => candidate.name === "subagent" && can
     }
   }
 }
-
 const asyncJsonlPaths = new Set();
-const waitDetails = resultMessage(waitCall)?.details;
-collectJsonlPaths(waitDetails?.completions ?? waitDetails, asyncJsonlPaths);
+collectJsonlPaths(resultMessage(waitCall)?.details, asyncJsonlPaths);
 asyncJsonlPaths.delete(sessionPath);
 const asyncNestedUsage = usageZero();
 for (const file of asyncJsonlPaths) addUsage(asyncNestedUsage, usageFromJsonl(file));
-
 const nestedSubagentUsage = usageZero();
 addUsage(nestedSubagentUsage, syncNestedUsage);
 addUsage(nestedSubagentUsage, asyncNestedUsage);
 
 const scenarioPassed = Object.values(scenarios).filter(Boolean).length;
 const scenarioTotal = Object.keys(scenarios).length;
-const subagentCalls = findCalls((call) => call.name === "subagent");
-const expectedCoreSubagentCalls = 6;
-const extraSubagentCalls = Math.max(0, subagentCalls.length - expectedCoreSubagentCalls);
-
 const metrics = {
   runId,
   benchmarkVersion: meta.benchmarkVersion,
@@ -271,37 +239,33 @@ const metrics = {
   provider: probeAssistant.provider ?? "unknown",
   model: probeAssistant.model ?? "unknown",
   cleanContext,
-  cleanProbeText,
   cleanProbeUsage,
   parentUsage,
   nestedSubagentUsage,
-  nestedUsageEvidence: {
-    syncUsageSources,
-    asyncJsonlPaths: [...asyncJsonlPaths],
-    syncUsage: syncNestedUsage,
-    asyncUsage: asyncNestedUsage,
-  },
   coreWallMs: Math.max(0, meta.coreEndedAtMs - meta.startedAtMs),
   static: staticMetrics,
+  surfaces: { initial: initialSurface, advanced: advancedSurface ?? null, restored: restoredSurface ?? null, wait: waitSurface ?? null, final: finalSurface ?? null },
   toolDiscipline: {
     capabilitySequence,
     expectedCapabilitySequence,
     capabilityDiscipline,
     subagentCalls: subagentCalls.length,
     expectedCoreSubagentCalls,
+    expectedChildRuns: Number(meta.expectedChildRuns ?? config.expectedChildRuns ?? 5),
     extraSubagentCalls,
     waitCalls: findCalls((call) => call.name === "subagent_wait").length,
+    pass: disciplinePass,
+  },
+  nestedUsageEvidence: {
+    syncUsageSources,
+    asyncJsonlPaths: [...asyncJsonlPaths],
+    syncUsage: syncNestedUsage,
+    asyncUsage: asyncNestedUsage,
   },
   scenarios,
   scenarioPassed,
   scenarioTotal,
-  deterministicPass: scenarioPassed === scenarioTotal,
-  diagnostics: {
-    workerTestOutput: workerTestOutput.trim().slice(-4000),
-    derivedExact,
-    expectedWorkflowScriptSha256: meta.workflowScriptSha256,
-    workflowScriptExact: Boolean(advanced && advanced.args?.workflowScript?.trim() === expectedWorkflowScript),
-  },
+  deterministicPass: scenarioPassed === scenarioTotal && disciplinePass,
 };
 fs.writeFileSync(path.join(runDir, "metrics.json"), `${JSON.stringify(metrics, null, 2)}\n`);
 meta.sessionPath = sessionPath;
@@ -311,14 +275,15 @@ fs.writeFileSync(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
 
 process.stdout.write(`${JSON.stringify({
   runId,
-  sessionPath,
   deterministicPass: metrics.deterministicPass,
   scenarios: `${scenarioPassed}/${scenarioTotal}`,
+  piSubagentsModelFacingBytes: initialSurface?.piSubagentsModelFacingToolDefinitionBytes ?? null,
+  minimalSchemaBytes: staticMetrics.minimalSchemaBytes,
+  fullSchemaBytes: staticMetrics.fullSchemaBytes,
+  capabilitySequence,
+  extraSubagentCalls,
   cleanProbeUsage,
-  cleanContext,
   parentUsage,
   nestedSubagentUsage,
   coreWallMs: metrics.coreWallMs,
-  capabilitySequence,
-  extraSubagentCalls,
 }, null, 2)}\n`);
