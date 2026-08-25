@@ -39,6 +39,26 @@ All model-facing subagent execution is expressed through `workflowScript` in the
 
 Child results cross into the script as plain JSON data. Non-JSON host metadata is omitted, so use returned fields such as `runId`, `ok`, `output`, and `structuredOutput` for workflow control.
 
+Validate a script without launching children:
+
+```js
+subagent({ action: "validate", workflowScript: `
+  const results = await runs.all([{ key: "scan", agent: "scout", task: "Scan" }]);
+  return results[0].output;
+` });
+```
+
+For a script stored in a file, use `workflowScriptPath` instead of `workflowScript`:
+
+```js
+subagent({ workflowScriptPath: "workflows/review.js", cwd: "/path/to/project" });
+subagent({ action: "validate", workflowScriptPath: "workflows/review.js" });
+```
+
+The fields are mutually exclusive. Relative paths resolve against the request `cwd`; absolute paths pass through. The host reads the file before validation, schedule creation, or workflow sandbox execution. The sandbox still has no filesystem access. Missing, unreadable, and empty files return file input errors instead of script syntax errors.
+
+The result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, literal `runs.run` and `runs.all` keys, duplicate literal keys in one `runs.all` group, direct keyed access to a known `runs.all` result, and statically clear non-JSON boundary values. Dynamic keys and other runtime-only values are accepted without a warning. Validation does not discover agents, launch children, or create run artifacts.
+
 ```js
 subagent({ workflowScript: `
   const scan = await runs.run("scan", { agent: "scout", task: "Scan the codebase" });

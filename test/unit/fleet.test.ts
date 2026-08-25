@@ -761,7 +761,7 @@ describe("native subagent fleet", () => {
 				cwd,
 				sessionId: "session-current",
 				updatedAt: 200,
-				children: [{ agent: "worker", index: 0, status: "completed", finalOutput: "do not persist this when an artifact exists", savedOutputPath: outputPath, extensionBindings: { "shepherd.dispatch/1": { role: "coder" } } }],
+				children: [{ agent: "worker", index: 0, status: "completed", finalOutput: "do not persist this when an artifact exists", savedOutputPath: outputPath, resumeContract: { outputSchema: { type: "object" }, agentContract: { version: 1 }, acceptance: false, output: false, outputMode: "inline" }, extensionBindings: { "shepherd.dispatch/1": { role: "coder" } } }],
 			});
 			state.foregroundRuns!.set("other-session", {
 				runId: "other-session",
@@ -779,6 +779,7 @@ describe("native subagent fleet", () => {
 			restored.baseCwd = cwd;
 			restored.artifactDirPreference = "project";
 			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 1);
+			assert.deepEqual(restored.foregroundRuns?.get("restored")?.children[0]?.resumeContract, { outputSchema: { type: "object" }, agentContract: { version: 1 }, acceptance: false, output: false, outputMode: "inline" });
 			assert.deepEqual(restored.foregroundRuns?.get("restored")?.children[0]?.extensionBindings, { "shepherd.dispatch/1": { role: "coder" } });
 			const snapshot = collectFleetSnapshot(restored);
 			assert.deepEqual(snapshot.items.map((item) => item.key), ["foreground-recent:restored:0"]);
@@ -847,6 +848,45 @@ describe("native subagent fleet", () => {
 			persistForegroundRunHistory(state, { resultsDir });
 			const persisted = JSON.parse(fs.readFileSync(path.join(resultsDir, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string }> };
 			assert.deepEqual(persisted.runs.map((run) => run.runId), ["terminal"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not restore or persist oversized foreground resume contracts", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-contract-bound-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			fs.mkdirSync(resultsDir, { recursive: true });
+			const oversizedContract = { outputSchema: { type: "object", description: "x".repeat(65 * 1024) } };
+			fs.writeFileSync(path.join(resultsDir, "foreground-history.json"), JSON.stringify({
+				version: 1,
+				runs: [{
+					runId: "oversized",
+					mode: "single",
+					cwd: root,
+					sessionId: "session-current",
+					updatedAt: 200,
+					children: [{ agent: "worker", index: 0, status: "completed", resumeContract: oversizedContract }],
+				}],
+			}), "utf-8");
+
+			const restored = stateForTest();
+			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 0);
+			assert.equal(restored.foregroundRuns?.has("oversized"), false);
+
+			const state = stateForTest();
+			state.foregroundRuns!.set("oversized", {
+				runId: "oversized",
+				mode: "single",
+				cwd: root,
+				sessionId: "session-current",
+				updatedAt: 200,
+				children: [{ agent: "worker", index: 0, status: "completed", resumeContract: oversizedContract }],
+			});
+			persistForegroundRunHistory(state, { resultsDir });
+			const persisted = JSON.parse(fs.readFileSync(path.join(resultsDir, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string }> };
+			assert.deepEqual(persisted.runs, []);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -969,6 +1009,44 @@ describe("native subagent fleet", () => {
 			try {
 				const rendered = component.render(100).join("\n");
 				assert.match(rendered, /TRUSTED SESSION FALLBACK/);
+				assert.doesNotMatch(rendered, /without a trusted root|Session read failed/);
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("previews an exact runtime-recorded workflow session under the Pi sessions base", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-recorded-session-"));
+		try {
+			const asyncDir = writeAsyncRun(root, { id: "async-recorded-session" });
+			const sessionsBase = path.join(root, "sessions");
+			const projectDir = path.join(sessionsBase, "project");
+			fs.mkdirSync(projectDir, { recursive: true });
+			const sessionFile = path.join(projectDir, "workflow-child.jsonl");
+			fs.writeFileSync(sessionFile, `${JSON.stringify({ role: "assistant", content: "RECORDED WORKFLOW SESSION" })}\n`, "utf-8");
+			const statusPath = path.join(asyncDir, "status.json");
+			const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { sessionFile?: string; steps?: Array<{ sessionFile?: string; transcriptPath?: string }> };
+			status.sessionFile = sessionFile;
+			status.steps![0]!.sessionFile = sessionFile;
+			delete status.steps![0]!.transcriptPath;
+			fs.writeFileSync(statusPath, JSON.stringify(status, null, 2), "utf-8");
+
+			const state = stateForTest();
+			state.trustedSessionRoots = [];
+			state.trustedSessionFileRoot = sessionsBase;
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000 },
+			);
+			try {
+				const rendered = component.render(100).join("\n");
+				assert.match(rendered, /RECORDED WORKFLOW SESSION/);
 				assert.doesNotMatch(rendered, /without a trusted root|Session read failed/);
 			} finally {
 				component.dispose();

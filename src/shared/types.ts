@@ -75,6 +75,22 @@ export interface WorkflowGraphSnapshot {
 
 export type WorkflowReceiptState = "complete" | "failed" | "paused" | "stopped";
 
+export interface WorkflowChildSummaryV1 {
+	version: 1;
+	parentToolCallId: string;
+	workflowRunId: string;
+	inventoryComplete: boolean;
+	workflowState: "queued" | "running" | "completed" | "failed" | "paused" | "stopped";
+	children: Array<{
+		childId: string;
+		runId?: string;
+		agent?: string;
+		model?: string;
+		thinking?: string;
+		state: "pending" | "running" | "completed" | "failed" | "paused" | "stopped" | "rejected" | "detached";
+	}>;
+}
+
 type WorkflowReceiptEntryResumability =
 	| { latestRunId: string; resumability: { state: "resumable" } }
 	| { latestRunId?: string; resumability: { state: "not-resumable"; reason: string } };
@@ -95,6 +111,7 @@ export interface WorkflowReceipt {
 	state: WorkflowReceiptState;
 	createdAt: number;
 	entries: Record<string, WorkflowReceiptEntry>;
+	workflowChildren?: WorkflowChildSummaryV1;
 }
 
 export interface SavedOutputReference {
@@ -167,6 +184,10 @@ export interface TokenUsage {
 	input: number;
 	output: number;
 	total: number;
+	/** Input plus cache-read tokens for the latest assistant turn. */
+	window?: number;
+	/** Largest window observed in this usage scope. */
+	windowPeak?: number;
 }
 
 export type ActivityState = "active_long_running" | "needs_attention";
@@ -704,6 +725,8 @@ export interface AgentProgress {
 	thinking?: string;
 	inputTokens?: number;
 	outputTokens?: number;
+	window?: number;
+	windowPeak?: number;
 	durationMs: number;
 	error?: string;
 	failedTool?: string;
@@ -1093,6 +1116,7 @@ export interface WaitCompletion {
 	/** Versioned bounded output archive retained with the durable completion replay. */
 	archivePath?: string;
 	results?: WaitCompletionChild[];
+	workflowChildren?: WorkflowChildSummaryV1;
 }
 
 export interface Details {
@@ -1103,6 +1127,7 @@ export interface Details {
 	/** Run-level context summary. "mixed" when children resolved to different modes. */
 	context?: "fresh" | "fork" | "mixed";
 	results: SingleResult[];
+	workflowChildren?: WorkflowChildSummaryV1;
 	/**
 	 * Terminal completion payloads for runs this subagent_wait call observed
 	 * finishing. Async completions travel as result files that are consumed and
@@ -1537,6 +1562,7 @@ export interface AsyncStatus {
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
 	workflow?: Details["workflow"];
+	workflowChildren?: WorkflowChildSummaryV1;
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
 	/** Set when a durable schedule launched this run, so completions can name their origin. */
@@ -1692,6 +1718,7 @@ export interface AsyncJobState {
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
 	workflow?: Details["workflow"];
+	workflowChildren?: WorkflowChildSummaryV1;
 }
 
 export interface ForegroundResumeChild {
@@ -1709,6 +1736,8 @@ export interface ForegroundResumeChild {
 	currentPath?: string;
 	turnCount?: number;
 	tokens?: number;
+	window?: number;
+	windowPeak?: number;
 	toolCount?: number;
 	exitCode?: number;
 	error?: string;
@@ -1723,6 +1752,14 @@ export interface ForegroundResumeChild {
 	detachedReason?: string;
 	acceptance?: AcceptanceLedger;
 	agentContract?: AgentContract;
+	/** Private bounded launch fields needed to preserve the child contract on resume. */
+	resumeContract?: {
+		outputSchema?: JsonSchemaObject;
+		agentContract?: AgentContract;
+		acceptance?: AcceptanceInput;
+		output?: string | boolean;
+		outputMode?: OutputMode;
+	};
 	launchContractDigest?: string;
 	/** Private retained launch authority. Never project into status or result output. */
 	extensionBindings?: ExtensionBindings;
@@ -1761,6 +1798,8 @@ export interface ForegroundChildControl {
 	tokens?: number;
 	inputTokens?: number;
 	outputTokens?: number;
+	window?: number;
+	windowPeak?: number;
 	model?: string;
 	thinking?: string;
 	toolCount?: number;
@@ -1796,6 +1835,8 @@ export interface ForegroundRunControl {
 	tokens?: number;
 	inputTokens?: number;
 	outputTokens?: number;
+	window?: number;
+	windowPeak?: number;
 	model?: string;
 	thinking?: string;
 	toolCount?: number;
@@ -1846,6 +1887,8 @@ export interface SubagentState {
 	parentSessionFile?: string | null;
 	/** Extension-owned roots trusted for child session transcript reads. */
 	trustedSessionRoots?: string[];
+	/** Pi sessions base that caps exact runtime-recorded session file trust. */
+	trustedSessionFileRoot?: string;
 	/** Live async session roots created by this parent executor, keyed by run id. */
 	liveAsyncSessionRoots?: Map<string, string>;
 	/** Last valid parent session model observed for this session; used when continuation contexts omit ctx.model. */
@@ -2330,7 +2373,7 @@ export const POLL_INTERVAL_MS = 250;
 export const WIDGET_ANIMATION_INTERVAL_MS = 1000;
 export const MAX_WIDGET_JOBS = 4;
 export const DEFAULT_SUBAGENT_MAX_DEPTH = 2;
-export const SUBAGENT_ACTIONS = ["list", "get", "models", "children.list", "guide", "create", "update", "delete", "eject", "disable", "enable", "reset", "mission.create", "mission.list", "mission.show", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "worktree.discard", "refine", "refine.show", "refine.rollback", "inspector.open", "inspector.status", "inspector.close", "project.open", "project.status", "project.close", "status", "debug.run", "grant-spawn-budget", "interrupt", "resume", "steer", "stop", "dismiss", "doctor", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "schedule.create", "schedule.list", "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"] as const;
+export const SUBAGENT_ACTIONS = ["list", "get", "models", "children.list", "guide", "validate", "create", "update", "delete", "eject", "disable", "enable", "reset", "mission.create", "mission.list", "mission.show", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "worktree.discard", "refine", "refine.show", "refine.rollback", "inspector.open", "inspector.status", "inspector.close", "project.open", "project.status", "project.close", "status", "debug.run", "grant-spawn-budget", "interrupt", "resume", "steer", "stop", "dismiss", "doctor", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "schedule.create", "schedule.list", "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"] as const;
 
 export const DEFAULT_FORK_PREAMBLE =
 	"You are a delegated subagent running from a fork of the parent session. " +

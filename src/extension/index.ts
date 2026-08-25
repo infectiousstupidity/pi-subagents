@@ -24,6 +24,7 @@ import { clearRuntimeAgentsForPi, listRuntimeAgentConfigs, mergeRuntimeAgents } 
 import { ensureAccessibleDir } from "../shared/accessible-dir.ts";
 import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
+import { getAgentDir } from "../shared/utils.ts";
 import { currentCompletionOwnerId } from "../shared/completion-owner.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
 import { clearLegacyResultAnimationTimer, renderSubagentResult, renderSubagentSummary } from "../tui/render.ts";
@@ -382,9 +383,13 @@ export function projectActiveHerdrRuns(state: SubagentState): HerdrStatusRun[] {
 		.filter((job) => active(job.status))
 		.map((job) => {
 			const children = job.mode === "workflow" ? foregroundChildrenByWorkflow.get(job.asyncId) : undefined;
+			const currentStep = job.steps?.find((step) => step.status === "running")
+				?? (job.currentStep !== undefined ? job.steps?.[job.currentStep] : undefined)
+				?? job.steps?.find((step) => step.status === "pending");
 			return {
 				id: job.asyncId,
 				agents: children?.length ? children.map((child) => child.agent) : job.agents,
+				...(currentStep?.label ? { taskLabel: currentStep.label } : {}),
 				needsAttention: job.activityState === "needs_attention" || children?.some((child) => child.needsAttention),
 			};
 		});
@@ -697,6 +702,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					0,
 					0,
 				);
+			if (args.workflowScriptPath)
+				return new Text(
+					`${title}${gap}${theme.fg("accent", args.workflowScriptPath)}${args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : ""}`,
+					0,
+					0,
+				);
 			const asyncLabel = args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : "";
 			return new Text(
 				`${title}${gap}${theme.fg("accent", args.agent || "?")}${asyncLabel}`,
@@ -848,6 +859,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		goalTurnId = 0;
 		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
 		state.parentSessionFile = ctx.sessionManager.getSessionFile();
+		state.trustedSessionFileRoot = state.parentSessionFile ? path.join(getAgentDir(), "sessions") : undefined;
 		state.trustedSessionRoots = [...new Set([
 			...(config.defaultSessionDir ? [path.resolve(expandTilde(config.defaultSessionDir))] : []),
 			...(state.parentSessionFile ? [getSubagentSessionRoot(state.parentSessionFile)] : []),

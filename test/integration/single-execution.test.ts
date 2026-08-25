@@ -630,16 +630,17 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 1);
 	});
 
-	it("allows schedule.create to carry the required workflowScript target", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("allows schedule.create to load its workflowScript target from a path", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		let forwarded;
 		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, async (params) => {
 			forwarded = params;
 			return { content: [{ type: "text", text: "created" }], details: { mode: "management", results: [] } };
 		});
+		fs.writeFileSync(path.join(tempDir, "scheduled.js"), "return runs.run('main', { agent: 'echo' })");
 
-		const result = await executor.execute(
+		const result = await executor.executePublic(
 			"schedule-create",
-			{ action: "schedule.create", id: "nightly", every: "1h", workflowScript: "return runs.run('main', { agent: 'echo' })" },
+			{ action: "schedule.create", id: "nightly", every: "1h", workflowScriptPath: "scheduled.js" },
 			new AbortController().signal,
 			undefined,
 			makeMinimalCtx(tempDir),
@@ -648,6 +649,88 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.isError, undefined);
 		assert.equal(result.content[0]?.text, "created");
 		assert.equal(forwarded?.workflowScript, "return runs.run('main', { agent: 'echo' })");
+	});
+
+	it("validates workflow scripts without launching children or creating artifacts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const before = fs.readdirSync(tempDir).sort();
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), () => {
+			throw new Error("validate must not discover or launch agents");
+		});
+
+		const result = await executor.executePublic(
+			"offline-validation",
+			{ action: "validate", workflowScript: `return runs.run("bad key", { agent: "echo" });` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.deepEqual(JSON.parse(result.content[0]?.text ?? "null"), {
+			ok: false,
+			errors: [{ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", line: 1, column: 17 }],
+		});
+		assert.equal(mockPi.callCount(), 0);
+		assert.deepEqual(fs.readdirSync(tempDir).sort(), before);
+	});
+
+	it("loads workflowScriptPath from the request cwd for validation without launching", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const requestCwd = path.join(tempDir, "request-cwd");
+		fs.mkdirSync(requestCwd);
+		fs.writeFileSync(path.join(requestCwd, "workflow.js"), `return runs.run("bad key", { agent: "echo" });`);
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), () => {
+			throw new Error("validate must not discover or launch agents");
+		});
+
+		const result = await executor.executePublic(
+			"file-validation",
+			{ action: "validate", cwd: "request-cwd", workflowScriptPath: "workflow.js" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.deepEqual(JSON.parse(result.content[0]?.text ?? "null"), {
+			ok: false,
+			errors: [{ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", line: 1, column: 17 }],
+		});
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("reports missing and empty workflowScriptPath files before validation", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		fs.writeFileSync(path.join(tempDir, "empty.js"), " \n");
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), () => {
+			throw new Error("file input errors must not discover or launch agents");
+		});
+
+		const missing = await executor.executePublic("missing-file", { action: "validate", workflowScriptPath: "missing.js" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(missing.isError, true);
+		assert.match(missing.content[0]?.text ?? "", /Failed to read workflowScriptPath.*missing\.js/);
+		assert.doesNotMatch(missing.content[0]?.text ?? "", /validation failed|valid JavaScript/);
+
+		const empty = await executor.executePublic("empty-file", { action: "validate", workflowScriptPath: "empty.js" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(empty.isError, true);
+		assert.match(empty.content[0]?.text ?? "", /workflowScriptPath file .*empty\.js.* is empty/);
+		assert.doesNotMatch(empty.content[0]?.text ?? "", /validation failed|valid JavaScript/);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("executes a workflow loaded from workflowScriptPath", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		fs.writeFileSync(path.join(tempDir, "workflow.js"), `return runs.run("main", { agent: "echo", task: "from file" });`);
+		mockPi.onCall({ output: "loaded workflow" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.executePublic(
+			"file-execution",
+			{ async: false, workflowScriptPath: path.join(tempDir, "workflow.js") },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "file workflow failed");
+		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("starts workflow scripts asynchronously with a portable internal run id", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -4040,6 +4123,129 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		if (child?.artifactPaths?.outputPath) assert.match(fs.readFileSync(child.artifactPaths.outputPath, "utf-8"), /"note": "captured"/);
 	});
 
+	it("applies explicit structured-output contract fields when resuming a foreground workflow child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const schema = { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } };
+		const firstSchema = { type: "object", required: ["first"], properties: { first: { type: "boolean" } } };
+		const firstEvents = [
+			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { first: true } } },
+			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+			{ type: "tool_execution_end", toolName: "structured_output" },
+		];
+		const resumedEvents = [
+			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+			{ type: "tool_execution_end", toolName: "structured_output" },
+		];
+		mockPi.onCall({ stdoutRaw: firstEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { first: true } });
+		mockPi.onCall({ stdoutRaw: resumedEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
+		const result = await makeExecutor([makeAgent("echo")]).execute(
+			"workflow-explicit-resume-schema",
+			{
+				async: false,
+				workflowScript: `
+					const first = await runs.run("first", { agent: "echo", task: "First", outputSchema: ${JSON.stringify(firstSchema)}, agentContract: { version: 1 }, acceptance: false, output: true });
+					return runs.run("resumed", { resume: first.runId, task: "Resume", outputSchema: ${JSON.stringify(schema)}, agentContract: { version: 1 }, acceptance: false, output: false });
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		const resumed = result.details.workflow?.value as { ok?: boolean; structuredOutput?: unknown; savedOutputPath?: string };
+		assert.equal(resumed.ok, true);
+		assert.deepEqual(resumed.structuredOutput, { ok: true });
+		assert.equal(resumed.savedOutputPath, undefined);
+	});
+
+	it("preserves the structured-output contract when resume fields are omitted", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const schema = { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } };
+		const structuredEvents = [
+			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+			{ type: "tool_execution_end", toolName: "structured_output" },
+		];
+		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
+		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
+		const result = await makeExecutor([makeAgent("echo")]).execute(
+			"workflow-inherited-resume-schema",
+			{
+				async: false,
+				workflowScript: `
+					const first = await runs.run("first", { agent: "echo", task: "First", outputSchema: ${JSON.stringify(schema)}, agentContract: { version: 1 }, acceptance: false, output: false });
+					return runs.run("resumed", { resume: first.runId, task: "Resume" });
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		const resumed = result.details.workflow?.value as { ok?: boolean; structuredOutput?: unknown };
+		assert.equal(resumed.ok, true);
+		assert.deepEqual(resumed.structuredOutput, { ok: true });
+	});
+
+	it("preserves an agent default output contract when foreground workflow resume omits output", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const configuredOutput = path.join(tempDir, "configured-resume-output.md");
+		const agent = makeAgent("echo", { output: configuredOutput, outputMode: "file-only" });
+		const executor = makeExecutor([agent]);
+		mockPi.onCall({ output: "first report" });
+		mockPi.onCall({ output: "resumed report" });
+
+		const firstResult = await executor.execute(
+			"workflow-agent-output-first",
+			{ async: false, workflowScript: `return runs.run("first", { agent: "echo", task: "First", acceptance: false });` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(firstResult.isError, undefined, firstResult.content[0]?.text ?? "workflow failed");
+		const first = firstResult.details.workflow?.value as { runId?: string };
+		const firstChild = firstResult.details.results[0];
+		assert.ok(first.runId);
+		assert.equal(firstChild?.savedOutputPath, configuredOutput);
+		assert.equal(firstChild?.outputMode, "file-only");
+
+		agent.output = undefined;
+		agent.outputMode = undefined;
+		const resumedResult = await executor.execute(
+			"workflow-agent-output-resumed",
+			{ async: false, workflowScript: `return runs.run("resumed", { resume: ${JSON.stringify(first.runId)}, task: "Resume" });` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(resumedResult.isError, undefined, resumedResult.content[0]?.text ?? "workflow failed");
+		const resumed = resumedResult.details.results[0];
+		assert.match(resumed?.finalOutput ?? "", new RegExp(`Output saved to: ${escapeRegExp(configuredOutput)}`));
+		assert.equal(fs.readFileSync(configuredOutput, "utf-8"), "resumed report");
+	});
+
+	it("fails closed on an invalid explicit foreground resume output schema", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "first result" });
+		const result = await makeExecutor([makeAgent("echo")]).execute(
+			"workflow-invalid-explicit-resume-schema",
+			{
+				async: false,
+				workflowScript: `
+					const first = await runs.run("first", { agent: "echo", task: "First" });
+					return runs.run("resumed", { resume: first.runId, task: "Resume", outputSchema: null });
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /outputSchema must be a JSON Schema object/);
+		assert.equal(mockPi.callCount(), 1);
+	});
+
 	it("workflow children with outputSchema can satisfy inherited checked acceptance", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const acceptanceReport = {
 			criteriaSatisfied: [{ id: "proof", status: "satisfied", evidence: "structured output returned ok true" }],
@@ -5191,6 +5397,27 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.exitCode, 0);
 		assert.ok(runningUpdates.length >= 2, "expected an initial update and a heartbeat before child output");
 		assert.ok((runningUpdates.at(-1)?.durationMs ?? 0) > (runningUpdates[0]?.durationMs ?? 0), "expected heartbeat duration to advance");
+	});
+
+	it("reports foreground context window usage without changing cumulative spend", async () => {
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done" }],
+					model: "mock/test-model",
+					stopReason: "stop",
+					usage: { input: 11, output: 7, cacheRead: 30, cacheWrite: 0, cost: { total: 0.001 } },
+				},
+			}],
+		});
+
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {});
+
+		assert.equal(result.progress.tokens, 18);
+		assert.equal(result.progress.window, 41);
+		assert.equal(result.progress.windowPeak, 41);
 	});
 
 	it("tracks live activity updates and exposes artifact paths while running", async () => {
