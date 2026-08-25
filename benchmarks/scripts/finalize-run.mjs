@@ -16,6 +16,12 @@ const metricsPath = path.join(runDir, "metrics.json");
 const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
 const metrics = JSON.parse(fs.readFileSync(metricsPath, "utf8"));
 
+function cleanPromptTokensFor(value) {
+  if (Number.isFinite(Number(value?.cleanPromptTokens))) return Number(value.cleanPromptTokens);
+  const usage = value?.cleanProbeUsage ?? {};
+  return Number(usage.input ?? 0) + Number(usage.cacheRead ?? 0) + Number(usage.cacheWrite ?? 0);
+}
+
 function previousComparableRun() {
   const runsRoot = path.join(resultsRoot, "runs");
   if (!fs.existsSync(runsRoot)) return null;
@@ -42,11 +48,12 @@ function previousComparableRun() {
 const previous = previousComparableRun();
 const pct = (current, prior) => prior > 0 ? ((current - prior) / prior) * 100 : null;
 const initialBytes = Number(metrics.cleanContext?.surface?.piSubagentsModelFacingToolDefinitionBytes ?? 0);
+const cleanPromptTokens = cleanPromptTokensFor(metrics);
 const comparison = previous ? {
   runId: previous.meta.runId,
   minimalSchemaBytesPct: pct(metrics.static.minimalSchemaBytes, previous.metrics.static?.minimalSchemaBytes ?? 0),
   piSubagentsModelFacingBytesPct: pct(initialBytes, previous.metrics.cleanContext?.surface?.piSubagentsModelFacingToolDefinitionBytes ?? 0),
-  cleanProbeTotalTokensPct: pct(metrics.cleanProbeUsage.totalTokens, previous.metrics.cleanProbeUsage?.totalTokens ?? 0),
+  cleanPromptTokensPct: pct(cleanPromptTokens, cleanPromptTokensFor(previous.metrics)),
   coreParentTotalTokensPct: pct(metrics.parentUsage.totalTokens, previous.metrics.parentUsage?.totalTokens ?? 0),
   nestedSubagentTotalTokensPct: pct(metrics.nestedSubagentUsage.totalTokens, previous.metrics.nestedSubagentUsage?.totalTokens ?? 0),
   coreWallMsPct: pct(metrics.coreWallMs, previous.metrics.coreWallMs ?? 0),
@@ -88,18 +95,18 @@ const dirtySection = meta.repoRelevantDirty
 
 const report = `# pi-subagents benchmark v${meta.benchmarkVersion} — ${runId}\n\n`
 + `Status: **${overall}**  \nScenarios: **${metrics.scenarioPassed}/${metrics.scenarioTotal}**  \nDiscipline: **${metrics.toolDiscipline.pass ? "PASS" : "FAIL"}**\n\n`
-+ `## Context tax\n\n| Metric | Value |\n|---|---:|\n| Clean probe tokens | ${metrics.cleanProbeUsage.totalTokens} |\n| System prompt | ${metrics.cleanContext?.systemPromptBytes ?? "n/a"} bytes |\n| All active model-facing tool defs | ${surface.activeModelFacingToolDefinitionBytes ?? "n/a"} bytes |\n| pi-subagents model-facing defs | ${surface.piSubagentsModelFacingToolDefinitionBytes ?? "n/a"} bytes |\n| subagent | ${byTool.subagent ?? "n/a"} bytes |\n| subagent_capability | ${byTool.subagent_capability ?? "n/a"} bytes |\n| subagent_wait initially active | ${surface.subagentWaitActive ? "YES" : "no"} |\n| Minimal schema | ${metrics.static.minimalSchemaBytes} bytes |\n| Full schema | ${metrics.static.fullSchemaBytes} bytes |\n| Minimal/full | ${(metrics.static.minimalToFullRatio * 100).toFixed(2)}% |\n\n`
++ `## Context tax\n\n| Metric | Value |\n|---|---:|\n| Clean prompt | ${cleanPromptTokens} tokens |\n| Probe output | ${metrics.cleanProbeUsage.output} tokens |\n| Probe tool-free | ${metrics.cleanProbe?.toolFree ? "yes" : "NO"} |\n| System prompt | ${metrics.cleanContext?.systemPromptBytes ?? "n/a"} bytes |\n| All active model-facing tool defs | ${surface.activeModelFacingToolDefinitionBytes ?? "n/a"} bytes |\n| pi-subagents model-facing defs | ${surface.piSubagentsModelFacingToolDefinitionBytes ?? "n/a"} bytes |\n| pi-subagents tools attributed by SourceInfo | ${surface.piSubagentsOwnershipSourceInfoCount ?? "n/a"} |\n| subagent | ${byTool.subagent ?? "n/a"} bytes |\n| subagent_capability | ${byTool.subagent_capability ?? "n/a"} bytes |\n| subagent_wait initially active | ${surface.subagentWaitActive ? "YES" : "no"} |\n| Minimal schema | ${metrics.static.minimalSchemaBytes} bytes |\n| Full schema | ${metrics.static.fullSchemaBytes} bytes |\n| Minimal/full | ${(metrics.static.minimalToFullRatio * 100).toFixed(2)}% |\n\n`
 + `## Function\n\n| Check | Result |\n|---|---|\n${scenarioRows}\n\n`
 + `## Discipline\n\n- Capability sequence: \`${metrics.toolDiscipline.capabilitySequence.join(" → ")}\`\n- Parent subagent calls: ${metrics.toolDiscipline.subagentCalls}/${metrics.toolDiscipline.expectedCoreSubagentCalls}\n- Expected child runs: ${metrics.toolDiscipline.expectedChildRuns}\n- Extra/retry subagent calls: ${metrics.toolDiscipline.extraSubagentCalls}\n- Wait calls: ${metrics.toolDiscipline.waitCalls}\n\n`
 + `## Informational usage\n\n- Parent: ${fmtUsage(metrics.parentUsage)}\n- Nested subagents: ${fmtUsage(metrics.nestedSubagentUsage)}\n- Core wall time: ${(metrics.coreWallMs / 1000).toFixed(1)}s\n\n`
-+ `## Comparable previous v${meta.benchmarkVersion} PASS\n\n${comparison ? `Previous: \`${comparison.runId}\`\n\n| Metric | Delta | Affects status |\n|---|---:|---|\n| Minimal schema bytes | ${fmtPct(comparison.minimalSchemaBytesPct)} | yes, >5% warns |\n| pi-subagents model-facing defs | ${fmtPct(comparison.piSubagentsModelFacingBytesPct)} | yes, >5% warns |\n| Clean probe tokens | ${fmtPct(comparison.cleanProbeTotalTokensPct)} | no |\n| Core parent tokens | ${fmtPct(comparison.coreParentTotalTokensPct)} | no |\n| Nested subagent tokens | ${fmtPct(comparison.nestedSubagentTotalTokensPct)} | no |\n| Core wall time | ${fmtPct(comparison.coreWallMsPct)} | no |` : "No prior clean PASS with the same benchmark version, Pi version, provider, and model."}\n`
++ `## Comparable previous v${meta.benchmarkVersion} PASS\n\n${comparison ? `Previous: \`${comparison.runId}\`\n\n| Metric | Delta | Affects status |\n|---|---:|---|\n| Minimal schema bytes | ${fmtPct(comparison.minimalSchemaBytesPct)} | yes, >5% warns |\n| pi-subagents model-facing defs | ${fmtPct(comparison.piSubagentsModelFacingBytesPct)} | yes, >5% warns |\n| Clean prompt tokens | ${fmtPct(comparison.cleanPromptTokensPct)} | no |\n| Core parent tokens | ${fmtPct(comparison.coreParentTotalTokensPct)} | no |\n| Nested subagent tokens | ${fmtPct(comparison.nestedSubagentTotalTokensPct)} | no |\n| Core wall time | ${fmtPct(comparison.coreWallMsPct)} | no |` : "No prior clean PASS with the same benchmark version, Pi version, provider, and model."}\n`
 + dirtySection;
 const reportPath = path.join(runDir, "report.md");
 fs.writeFileSync(reportPath, report);
 
 const resultsPath = path.join(resultsRoot, "RESULTS.md");
 fs.mkdirSync(resultsRoot, { recursive: true });
-const v3Header = `# pi-subagents benchmark results\n\nv3 measures only startup context tax, compact delegation, progressive disclosure, and async/wait. Parent/child token usage and wall time are informational and never change status.\n\n## Benchmark v3\n\n| Date | Run | pkg | commit | Pi | model | probe tokens | pi-subagents defs | minimal/full | function | parent | nested | wall | relevant dirty | status | report |\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n<!-- BENCHMARK_V3_ROWS -->\n`;
+const v3Header = `# pi-subagents benchmark results\n\nv3 measures only startup context tax, compact delegation, progressive disclosure, and async/wait. Parent/child token usage and wall time are informational and never change status.\n\n## Benchmark v3\n\n| Date | Run | pkg | commit | Pi | model | clean prompt | pi-subagents defs | minimal/full | function | parent | nested | wall | relevant dirty | status | report |\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n<!-- BENCHMARK_V3_ROWS -->\n`;
 
 if (!fs.existsSync(resultsPath)) {
   fs.writeFileSync(resultsPath, v3Header);
@@ -113,7 +120,7 @@ if (!fs.existsSync(resultsPath)) {
 let results = fs.readFileSync(resultsPath, "utf8");
 if (!results.includes(`| ${runId} |`)) {
   const date = meta.startedAt.slice(0, 10);
-  const row = `| ${date} | ${runId} | ${meta.packageVersion} | ${String(meta.commit).slice(0, 8)} | ${meta.piVersion} | ${metrics.provider}/${metrics.model} | ${metrics.cleanProbeUsage.totalTokens} | ${initialBytes} | ${metrics.static.minimalSchemaBytes}/${metrics.static.fullSchemaBytes} (${(metrics.static.minimalToFullRatio * 100).toFixed(1)}%) | ${metrics.scenarioPassed}/${metrics.scenarioTotal} | ${metrics.parentUsage.totalTokens} | ${metrics.nestedSubagentUsage.totalTokens} | ${(metrics.coreWallMs / 1000).toFixed(1)}s | ${meta.repoRelevantDirty ? "yes" : "no"} | **${overall}** | [report](runs/${runId}/report.md) |\n`;
+  const row = `| ${date} | ${runId} | ${meta.packageVersion} | ${String(meta.commit).slice(0, 8)} | ${meta.piVersion} | ${metrics.provider}/${metrics.model} | ${cleanPromptTokens} | ${initialBytes} | ${metrics.static.minimalSchemaBytes}/${metrics.static.fullSchemaBytes} (${(metrics.static.minimalToFullRatio * 100).toFixed(1)}%) | ${metrics.scenarioPassed}/${metrics.scenarioTotal} | ${metrics.parentUsage.totalTokens} | ${metrics.nestedSubagentUsage.totalTokens} | ${(metrics.coreWallMs / 1000).toFixed(1)}s | ${meta.repoRelevantDirty ? "yes" : "no"} | **${overall}** | [report](runs/${runId}/report.md) |\n`;
   results = results.replace("<!-- BENCHMARK_V3_ROWS -->", `${row}<!-- BENCHMARK_V3_ROWS -->`);
   fs.writeFileSync(resultsPath, results);
 }
@@ -122,7 +129,9 @@ process.stdout.write(`${JSON.stringify({
   runId,
   overall,
   scenarios: `${metrics.scenarioPassed}/${metrics.scenarioTotal}`,
-  cleanProbeUsage: metrics.cleanProbeUsage,
+  cleanPromptTokens,
+  cleanProbeOutputTokens: metrics.cleanProbeUsage.output,
+  cleanProbeToolFree: Boolean(metrics.cleanProbe?.toolFree),
   piSubagentsModelFacingToolDefinitionBytes: initialBytes,
   minimalSchemaBytes: metrics.static.minimalSchemaBytes,
   fullSchemaBytes: metrics.static.fullSchemaBytes,
