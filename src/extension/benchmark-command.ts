@@ -7,7 +7,13 @@ const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const STATE_TYPE = "pi-subagents-benchmark";
 const PROBE_MARKER = "BENCH_SUBAGENT_PROBE_V3";
 const SPEC_MARKER = "BENCH_SUBAGENT_V3";
-const SUBAGENT_TOOL_NAMES = new Set(["subagent", "subagent_capability", "subagent_wait"]);
+const KNOWN_SUBAGENT_TOOL_NAMES = new Set(["subagent", "subagent_capability", "subagent_wait"]);
+
+type SourceInfoLike = {
+	path?: string;
+	source?: string;
+	baseDir?: string;
+};
 
 type ToolInfoLike = {
 	name: string;
@@ -15,10 +21,16 @@ type ToolInfoLike = {
 	parameters?: unknown;
 	promptSnippet?: string;
 	promptGuidelines?: unknown;
+	sourceInfo?: SourceInfoLike;
 };
 
 function portablePath(value: string): string {
 	return value.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function comparablePath(value: string): string {
+	const normalized = portablePath(value);
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function resolveBenchmarkSpec(source: string): string {
@@ -79,12 +91,26 @@ function bytes(value: unknown): number {
 	return Buffer.byteLength(JSON.stringify(value));
 }
 
+function belongsToPiSubagents(tool: ToolInfoLike): boolean {
+	const sourceInfo = tool.sourceInfo;
+	if (sourceInfo) {
+		const root = comparablePath(packageRoot);
+		for (const candidate of [sourceInfo.path, sourceInfo.baseDir]) {
+			if (!candidate) continue;
+			const normalized = comparablePath(candidate);
+			if (normalized === root || normalized.startsWith(`${root}/`)) return true;
+		}
+		if (typeof sourceInfo.source === "string" && sourceInfo.source.toLowerCase().includes("pi-subagents")) return true;
+	}
+	return KNOWN_SUBAGENT_TOOL_NAMES.has(tool.name);
+}
+
 function surfaceSnapshot(pi: ExtensionAPI) {
 	const activeToolNames = pi.getActiveTools();
 	const active = new Set(activeToolNames);
 	const activeTools = (pi.getAllTools() as ToolInfoLike[]).filter((tool) => active.has(tool.name));
 	const activeContracts = activeTools.map(modelFacingContract);
-	const subagentTools = activeTools.filter((tool) => SUBAGENT_TOOL_NAMES.has(tool.name));
+	const subagentTools = activeTools.filter(belongsToPiSubagents);
 	const subagentContracts = subagentTools.map(modelFacingContract);
 	return {
 		activeToolNames,
@@ -94,6 +120,7 @@ function surfaceSnapshot(pi: ExtensionAPI) {
 		piSubagentsModelFacingBytesByTool: Object.fromEntries(
 			subagentTools.map((tool) => [tool.name, bytes(modelFacingContract(tool))]),
 		),
+		piSubagentsOwnershipSourceInfoCount: subagentTools.filter((tool) => Boolean(tool.sourceInfo)).length,
 		subagentWaitActive: active.has("subagent_wait"),
 	};
 }
