@@ -9,16 +9,35 @@ type RegisteredCommand = {
 	handler: (args: string, ctx: unknown) => Promise<void> | void;
 };
 
-function harness(branch: unknown[] = []) {
+function harness(initialBranch: unknown[] = []) {
 	let command: RegisteredCommand | undefined;
-	let sent: unknown;
+	const sent: unknown[] = [];
+	const entries: Array<{ customType: string; data: unknown }> = [];
 	const notifications: string[] = [];
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => void | Promise<void>>();
+	let branch = initialBranch;
 	const pi = {
 		registerCommand(_name: string, value: RegisteredCommand) {
 			command = value;
 		},
+		on(name: string, handler: (event: unknown, ctx: unknown) => void | Promise<void>) {
+			handlers.set(name, handler);
+		},
 		sendUserMessage(value: unknown) {
-			sent = value;
+			sent.push(value);
+		},
+		appendEntry(customType: string, data: unknown) {
+			entries.push({ customType, data });
+		},
+		getActiveTools() {
+			return ["read", "bash", "subagent", "subagent_capability"];
+		},
+		getAllTools() {
+			return [
+				{ name: "read", description: "read", parameters: {} },
+				{ name: "subagent", description: "subagent", parameters: {} },
+				{ name: "subagent_capability", description: "cap", parameters: {} },
+			];
 		},
 	} as unknown as ExtensionAPI;
 	registerBenchmarkCommand(pi);
@@ -27,8 +46,18 @@ function harness(branch: unknown[] = []) {
 		hasUI: true,
 		ui: { notify: (message: string) => notifications.push(message) },
 		sessionManager: { getBranch: () => branch },
+		getContextUsage: () => ({ tokens: 1234, contextWindow: 65536, percent: 1.9 }),
+		getSystemPrompt: () => "system prompt",
 	};
-	return { command: () => command!, sent: () => sent, notifications, ctx };
+	return {
+		command: () => command!,
+		sent,
+		entries,
+		notifications,
+		ctx,
+		setBranch(value: unknown[]) { branch = value; },
+		settled: () => handlers.get("agent_settled")!,
+	};
 }
 
 function sentText(value: unknown): string {
@@ -38,7 +67,7 @@ function sentText(value: unknown): string {
 }
 
 describe("bench-subagent command", () => {
-	it("resolves package paths independently of the Pi cwd", async () => {
+	it("runs a tiny probe before injecting the cwd-independent v2 specification", async () => {
 		const h = harness();
 		const previous = process.cwd();
 		process.chdir(os.tmpdir());
@@ -47,18 +76,41 @@ describe("bench-subagent command", () => {
 		} finally {
 			process.chdir(previous);
 		}
-		const text = sentText(h.sent());
-		assert.match(text, /BENCH_SUBAGENT_V1/);
-		assert.match(text, /Resolved package root:/);
-		assert.doesNotMatch(text, /node --experimental-strip-types benchmarks\/scripts\/start-run\.mjs/);
-		assert.match(text, /benchmarks\/scripts\/start-run\.mjs/);
-		assert.doesNotMatch(text, /Run from the root of the `pi-subagents` checkout under test/);
+
+		assert.equal(h.sent.length, 1);
+		assert.match(sentText(h.sent[0]), /BENCH_SUBAGENT_PROBE_V2/);
+		assert.doesNotMatch(sentText(h.sent[0]), /BENCH_SUBAGENT_V2/);
+		assert.equal(h.entries[0]?.customType, "pi-subagents-benchmark");
+		assert.equal((h.entries[0]?.data as { cleanContext?: { usage?: { tokens?: number } } }).cleanContext?.usage?.tokens, 1234);
+
+		h.setBranch([
+			{ type: "message", message: { role: "user", content: "BENCH_SUBAGENT_PROBE_V2\nReply exactly BENCH_PROBE_OK and do not call tools." } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "BENCH_PROBE_OK" }] } },
+		]);
+		await h.settled()({}, h.ctx as never);
+
+		assert.equal(h.sent.length, 2);
+		const spec = sentText(h.sent[1]);
+		assert.match(spec, /BENCH_SUBAGENT_V2/);
+		assert.match(spec, /Resolved package root:/);
+		assert.doesNotMatch(spec, /node --experimental-strip-types benchmarks\/scripts\/start-run\.mjs/);
+		assert.match(spec, /benchmarks\/scripts\/start-run\.mjs/);
+	});
+
+	it("does not inject the specification twice after the v2 marker exists", async () => {
+		const h = harness([
+			{ type: "message", message: { role: "user", content: "BENCH_SUBAGENT_PROBE_V2" } },
+			{ type: "message", message: { role: "assistant", content: "BENCH_PROBE_OK" } },
+			{ type: "message", message: { role: "user", content: "BENCH_SUBAGENT_V2" } },
+		]);
+		await h.settled()({}, h.ctx as never);
+		assert.equal(h.sent.length, 0);
 	});
 
 	it("refuses to contaminate an existing session", async () => {
 		const h = harness([{ type: "message", message: { role: "user", content: "already used" } }]);
 		await h.command().handler("", h.ctx as never);
-		assert.equal(h.sent(), undefined);
+		assert.equal(h.sent.length, 0);
 		assert.equal(h.notifications.some((message) => message.includes("fresh Pi session")), true);
 	});
 });
