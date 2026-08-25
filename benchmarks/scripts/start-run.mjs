@@ -21,9 +21,19 @@ const config = JSON.parse(fs.readFileSync(path.join(benchmarkDir, "benchmark.jso
 const pkg = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
 if (pkg.name !== "pi-subagents") throw new Error(`Expected pi-subagents package, got ${pkg.name ?? "unknown"}`);
 
+function exec(command, args) {
+  return execFileSync(command, args, { cwd: packageRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
 function run(command, args) {
   try {
-    return execFileSync(command, args, { cwd: packageRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    return exec(command, args).trim();
+  } catch {
+    return "unknown";
+  }
+}
+function runPreserveLeading(command, args) {
+  try {
+    return exec(command, args).replace(/[\r\n]+$/, "");
   } catch {
     return "unknown";
   }
@@ -102,7 +112,7 @@ const staticMetrics = {
 };
 write(path.join(runDir, "static.json"), `${JSON.stringify(staticMetrics, null, 2)}\n`);
 
-const repoStatus = run("git", ["status", "--porcelain=v1"]);
+const repoStatus = runPreserveLeading("git", ["status", "--porcelain=v1"]);
 const repoStatusLines = repoStatus && repoStatus !== "unknown" ? repoStatus.split(/\r?\n/).filter(Boolean) : [];
 const repoRelevantStatus = repoStatusLines.filter((line) => isBenchmarkRelevantDirtyPath(statusPath(line)));
 const repoDiffStat = run("git", ["diff", "--stat"]);
