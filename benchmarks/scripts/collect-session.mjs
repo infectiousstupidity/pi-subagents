@@ -32,6 +32,11 @@ function messageText(message) {
   if (!Array.isArray(content)) return "";
   return content.filter((part) => part?.type === "text").map((part) => part.text ?? "").join("\n");
 }
+function messageToolCallNames(message) {
+  const content = message?.content;
+  if (!Array.isArray(content)) return [];
+  return content.filter((part) => part?.type === "toolCall").map((part) => part.name ?? "unknown");
+}
 function usageZero() {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
 }
@@ -123,7 +128,7 @@ for (const file of walk(sessionRoot)) {
   const stat = fs.statSync(file);
   if (stat.mtimeMs < meta.startedAtMs - 5 * 60_000) continue;
   const text = fs.readFileSync(file, "utf8");
-  if (text.includes("BENCH_SUBAGENT_V3") && text.includes(runId)) candidates.push(file);
+  if (text.includes("BENCH_SUBAGENT_V4") && text.includes(runId)) candidates.push(file);
 }
 if (candidates.length !== 1) throw new Error(`Expected exactly one parent benchmark session, found ${candidates.length}: ${candidates.join(", ")}`);
 
@@ -137,10 +142,10 @@ for (let i = 0; i < entries.length; i += 1) {
   const entry = entries[i];
   if (entry.type === "message" && entry.message?.role === "user") {
     const text = messageText(entry.message);
-    if (text.includes("BENCH_SUBAGENT_PROBE_V3")) probeUserIndex = i;
-    if (text.includes("BENCH_SUBAGENT_V3")) benchmarkUserIndex = i;
+    if (text.includes("BENCH_SUBAGENT_PROBE_V4")) probeUserIndex = i;
+    if (text.includes("BENCH_SUBAGENT_V4")) benchmarkUserIndex = i;
   }
-  if (entry.type === "custom" && entry.customType === "pi-subagents-benchmark" && entry.data?.version === 3) {
+  if (entry.type === "custom" && entry.customType === "pi-subagents-benchmark" && entry.data?.version === 4) {
     if (entry.data.cleanContext) cleanContext = entry.data.cleanContext;
     if (entry.data.phase === "surface" && entry.data.surface) surfaceSnapshots.push(entry.data.surface);
   }
@@ -159,7 +164,7 @@ for (let i = 0; i < entries.length; i += 1) {
     assistantEntries.push({ index: i, entry });
     if (i > benchmarkUserIndex) addUsage(parentUsage, message.usage);
     if (i > benchmarkUserIndex) {
-      for (const part of message.content ?? []) {
+      for (const part of Array.isArray(message.content) ? message.content : []) {
         if (part?.type === "toolCall") toolCalls.push({ index: i, id: part.id, name: part.name, args: part.arguments ?? {} });
       }
     }
@@ -170,9 +175,7 @@ for (let i = 0; i < entries.length; i += 1) {
 const probeAssistantEntries = assistantEntries.filter((item) => item.index > probeUserIndex && item.index < benchmarkUserIndex);
 const probeAssistant = probeAssistantEntries[0]?.entry?.message;
 if (!probeAssistant) throw new Error("Could not find clean probe assistant response.");
-const cleanProbeToolCalls = probeAssistantEntries.flatMap((item) =>
-  (item.entry?.message?.content ?? []).filter((part) => part?.type === "toolCall").map((part) => part.name ?? "unknown")
-);
+const cleanProbeToolCalls = probeAssistantEntries.flatMap((item) => messageToolCallNames(item.entry?.message));
 const cleanProbeToolFree = probeAssistantEntries.length === 1 && cleanProbeToolCalls.length === 0;
 const cleanProbeText = messageText(probeAssistant).trim();
 const cleanProbeUsage = normalizedUsage(probeAssistant.usage);
