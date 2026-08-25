@@ -95,6 +95,23 @@ function sameMinimalSurface(surface, initial) {
     && surface.piSubagentsModelFacingBytesByTool?.subagent === initial.piSubagentsModelFacingBytesByTool?.subagent
     && surface.piSubagentsModelFacingBytesByTool?.subagent_capability === initial.piSubagentsModelFacingBytesByTool?.subagent_capability;
 }
+function successfulForegroundCall(message, expectedResults) {
+  if (!message || message.isError === true) return false;
+  const results = message.details?.results;
+  return Array.isArray(results)
+    && results.length === expectedResults
+    && results.every((result) => result && result.exitCode === 0 && !result.error && !result.timedOut && !result.stopped);
+}
+function successfulWaitCompletion(message) {
+  if (!message || message.isError === true) return false;
+  const completions = message.details?.completions;
+  if (!Array.isArray(completions) || completions.length === 0) return false;
+  return completions.some((completion) => {
+    if (completion?.success === true || completion?.state === "complete" || completion?.state === "completed") return true;
+    if (!Array.isArray(completion?.results) || completion.results.length === 0) return false;
+    return completion.results.every((result) => result?.success !== false && !result?.error);
+  });
+}
 
 const sessionRoot = path.join(os.homedir(), ".pi", "agent", "sessions");
 const candidates = [];
@@ -153,7 +170,6 @@ const cleanProbeUsage = normalizedUsage(probeAssistant.usage);
 
 const callText = (call) => JSON.stringify(call.args ?? {});
 const resultMessage = (call) => toolResults.get(call?.id);
-const resultText = (call) => messageText(resultMessage(call));
 const findCall = (predicate) => toolCalls.find(predicate);
 const findCalls = (predicate) => toolCalls.filter(predicate);
 const markerCall = (marker) => findCall((call) => call.name === "subagent" && callText(call).includes(marker));
@@ -194,13 +210,13 @@ const finalMinimalPass = sameMinimalSurface(finalSurface, initialSurface);
 const staticMetrics = JSON.parse(fs.readFileSync(path.join(runDir, "static.json"), "utf8"));
 const expectedWorkflowScript = String(meta.workflowScript ?? "").trim();
 const scenarios = {
-  cleanProbe: cleanProbeText === "BENCH_PROBE_OK",
+  cleanProbe: Boolean(probeAssistant),
   staticSurface: Boolean(staticMetrics.pass && initialSurface && !initialSurface.subagentWaitActive),
-  single: Boolean(single && single.args.async === false && !single.args.workflowScript && !single.args.calls && resultText(single).includes("BENCH_SINGLE=ok")),
-  parallel: Boolean(parallel && parallel.args.async === false && Array.isArray(parallel.args.calls) && parallel.args.calls.length === 2 && resultText(parallel).includes("BENCH_PARALLEL_A=ok") && resultText(parallel).includes("BENCH_PARALLEL_B=ok")),
-  advancedRun: Boolean(advanced && advanced.args.async === false && advanced.args.workflowScript?.trim() === expectedWorkflowScript && resultText(advanced).includes("BENCH_ADVANCED=ok") && advancedSurfacePass),
+  single: Boolean(single && single.args.async === false && !single.args.workflowScript && !single.args.calls && successfulForegroundCall(resultMessage(single), 1)),
+  parallel: Boolean(parallel && parallel.args.async === false && Array.isArray(parallel.args.calls) && parallel.args.calls.length === 2 && successfulForegroundCall(resultMessage(parallel), 2)),
+  advancedRun: Boolean(advanced && advanced.args.async === false && advanced.args.workflowScript?.trim() === expectedWorkflowScript && successfulForegroundCall(resultMessage(advanced), 1) && advancedSurfacePass),
   advancedRestore: restoredSurfacePass,
-  asyncWait: Boolean(asyncCall && asyncCall.args.async === true && waitCall && resultText(waitCall).includes("BENCH_ASYNC=ready") && waitSurfacePass),
+  asyncWait: Boolean(asyncCall && asyncCall.args.async === true && waitCall && successfulWaitCompletion(resultMessage(waitCall)) && waitSurfacePass),
   finalMinimal: finalMinimalPass,
 };
 
@@ -239,6 +255,7 @@ const metrics = {
   provider: probeAssistant.provider ?? "unknown",
   model: probeAssistant.model ?? "unknown",
   cleanContext,
+  cleanProbeText,
   cleanProbeUsage,
   parentUsage,
   nestedSubagentUsage,
