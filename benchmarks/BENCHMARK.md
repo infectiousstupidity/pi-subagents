@@ -28,7 +28,7 @@ node --experimental-strip-types benchmarks/scripts/start-run.mjs
 
 Keep the returned `runId`, `runDir`, `workspace`, and `workflowScriptPath`.
 
-The script checks only shipped production contracts. Repository unit tests/CI are deliberately outside this benchmark.
+The script checks only shipped production contracts. Repository unit tests/CI are deliberately outside this benchmark. It also records Git status/diff metadata. A dirty package checkout does not invalidate functional checks, but the finalized run is WARN and must not be treated as a clean baseline.
 
 ## Phase 1 — compact single child
 
@@ -97,7 +97,7 @@ Read `<workflowScriptPath>`. Pass its contents **verbatim** as `workflowScript` 
 
 Do not rewrite, regenerate, or "improve" the script.
 
-The script itself performs the sequential scout → worker dependency and expects `<workspace>/derived.txt` to become exactly:
+The generated script uses the current keyed workflow contract `runs.run(key, params)` and performs the sequential scout → worker dependency. It expects `<workspace>/derived.txt` to become exactly:
 
 ```text
 38
@@ -210,6 +210,8 @@ Write their outputs verbatim to:
 <runDir>/review-correctness.md
 ```
 
+The finalizer accepts the verdict line even if a reviewer wraps it in ordinary Markdown emphasis.
+
 ## Phase 9 — finalize
 
 Run exactly:
@@ -224,7 +226,8 @@ Finish by reporting only:
 - status,
 - scenarios passed/total,
 - clean probe usage,
-- clean estimated context,
+- clean pre-request snapshot,
+- pi-subagents-only active tool-definition bytes,
 - minimal/full schema bytes and ratio,
 - core parent tokens,
 - nested subagent tokens,
@@ -247,9 +250,10 @@ Hard failure:
 
 Warning:
 
+- package checkout is dirty; the run is diagnostic, not a clean baseline,
 - capability sequence is not exactly `advanced → minimal → wait → minimal`,
 - core contains extra subagent calls/retries,
 - either reviewer returns WARN,
-- clean probe usage or core usage materially increases versus a comparable v2 run.
+- clean probe usage or core usage materially increases versus a comparable successful v2 run.
 
-Only compare token/time numbers when benchmark version, Pi version, provider, and model match. Static schema metrics remain comparable across environments.
+Only compare token/time numbers when benchmark version, Pi version, provider, and model match. Failed/incomplete runs are never selected automatically as performance baselines. Static schema metrics remain comparable across environments.
