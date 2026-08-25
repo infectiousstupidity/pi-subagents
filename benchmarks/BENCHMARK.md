@@ -1,4 +1,4 @@
-# pi-subagents benchmark v3
+# pi-subagents benchmark v4
 
 Measure only startup context tax, compact delegation, progressive disclosure, and async/wait.
 
