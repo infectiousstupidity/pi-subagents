@@ -41,6 +41,9 @@ function bytes(value) {
 
 const commit = run("git", ["rev-parse", "HEAD"]);
 const shortCommit = commit === "unknown" ? "unknown" : commit.slice(0, 8);
+const gitStatus = run("git", ["status", "--porcelain"]);
+const gitDiffStat = run("git", ["diff", "--stat", "HEAD", "--"]);
+const repoDirty = gitStatus !== "unknown" && gitStatus.length > 0;
 const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
 const runId = `${stamp}-${shortCommit}-${crypto.randomBytes(2).toString("hex")}`;
 const resultsRoot = expandHome(config.resultsRoot);
@@ -72,13 +75,13 @@ const seedPath = path.join(workspace, "facts", "workflow-seed.txt");
 const derivedPath = path.join(workspace, "derived.txt");
 const seedTask = `[BENCH:ADV:SCOUT] Read ${seedPath}. Return exactly BENCH_ADV_SEED=19 and nothing else.`;
 const workflowScript = [
-  `const seed = await runs.run({ key: "seed", agent: "scout", task: ${JSON.stringify(seedTask)} });`,
+  `const seed = await runs.run("seed", { agent: "scout", task: ${JSON.stringify(seedTask)} });`,
   `if (!seed.ok) throw new Error("BENCH advanced seed child failed");`,
   `const match = String(seed.output ?? "").match(/BENCH_ADV_SEED=(\\d+)/);`,
   `if (!match) throw new Error("BENCH_ADV_SEED marker missing");`,
   `const value = Number(match[1]);`,
   `const target = value * 2;`,
-  `return await runs.run({ key: "write", agent: "worker", task: "[BENCH:ADV:WORKER] Write exactly " + target + "\\n to " + ${JSON.stringify(derivedPath)} + ". Then return exactly BENCH_ADV_WRITE=done and nothing else." });`,
+  `return await runs.run("write", { agent: "worker", task: "[BENCH:ADV:WORKER] Write exactly " + target + "\\n to " + ${JSON.stringify(derivedPath)} + ". Then return exactly BENCH_ADV_WRITE=done and nothing else." });`,
 ].join("\n");
 const workflowScriptPath = path.join(runDir, "workflow-script.txt");
 write(workflowScriptPath, `${workflowScript}\n`);
@@ -131,7 +134,9 @@ const meta = {
   packageVersion: pkg.version,
   commit,
   branch: run("git", ["branch", "--show-current"]),
-  repoDirty: run("git", ["status", "--porcelain"]) !== "",
+  repoDirty,
+  repoStatus: gitStatus === "unknown" ? [] : gitStatus.split(/\r?\n/).filter(Boolean).slice(0, 100),
+  repoDiffStat: gitDiffStat === "unknown" ? "unavailable" : gitDiffStat.slice(0, 8000),
   piVersion: run("pi", ["--version"]),
   nodeVersion: process.version,
   platform: `${process.platform}-${process.arch}`,
@@ -153,4 +158,5 @@ process.stdout.write(`${JSON.stringify({
   commit,
   benchmarkVersion: config.version,
   staticPass: staticMetrics.pass,
+  repoDirty,
 }, null, 2)}\n`);
