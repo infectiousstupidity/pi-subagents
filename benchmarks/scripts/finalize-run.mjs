@@ -16,12 +16,24 @@ const metricsPath = path.join(runDir, "metrics.json");
 const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
 const metrics = JSON.parse(fs.readFileSync(metricsPath, "utf8"));
 
+function parseReviewVerdict(text) {
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine
+      .trim()
+      .replace(/^(?:[-+*>]\s*)+/, "")
+      .replace(/[*_`]/g, "")
+      .trim();
+    const match = line.match(/^VERDICT\s*:\s*(PASS|WARN|FAIL)\s*$/i);
+    if (match) return match[1].toUpperCase();
+  }
+  return "INVALID";
+}
+
 function readReview(name) {
   const file = path.join(runDir, name);
   if (!fs.existsSync(file)) return { verdict: "MISSING", text: "(missing review)" };
   const text = fs.readFileSync(file, "utf8").trim();
-  const match = text.match(/^VERDICT:\s*(PASS|WARN|FAIL)\s*$/mi);
-  return { verdict: match?.[1]?.toUpperCase() ?? "INVALID", text };
+  return { verdict: parseReviewVerdict(text), text };
 }
 const efficiencyReview = readReview("review-efficiency.md");
 const correctnessReview = readReview("review-correctness.md");
@@ -68,6 +80,8 @@ function previousComparableRun() {
       if (otherMeta.benchmarkVersion !== meta.benchmarkVersion) continue;
       if (otherMeta.piVersion !== meta.piVersion) continue;
       if (otherMetrics.provider !== metrics.provider || otherMetrics.model !== metrics.model) continue;
+      // Failed/incomplete runs are diagnostics, not performance baselines.
+      if (otherMetrics.deterministicPass !== true || otherMetrics.postReviewCompactPass !== true) continue;
       candidates.push({ meta: otherMeta, metrics: otherMetrics });
     } catch {}
   }
@@ -92,6 +106,7 @@ const reviewFail = efficiencyReview.verdict === "FAIL"
   || correctnessReview.verdict === "INVALID";
 const reviewWarn = efficiencyReview.verdict === "WARN" || correctnessReview.verdict === "WARN";
 const disciplineWarn = !metrics.toolDiscipline.capabilityDiscipline || metrics.toolDiscipline.extraSubagentCalls > 0;
+const dirtyWorktreeWarn = meta.repoDirty === true;
 const comparableWarn = Boolean(comparison && (
   (comparison.minimalSchemaBytesPct ?? 0) > 5
   || (comparison.cleanProbeTotalTokensPct ?? 0) > 15
@@ -103,7 +118,11 @@ const hardPass = metrics.deterministicPass
   && postReviewCompactPass
   && efficiencyReview.verdict !== "MISSING"
   && correctnessReview.verdict !== "MISSING";
-const overall = !hardPass || reviewFail ? "FAIL" : reviewWarn || disciplineWarn || comparableWarn ? "WARN" : "PASS";
+const overall = !hardPass || reviewFail
+  ? "FAIL"
+  : reviewWarn || disciplineWarn || dirtyWorktreeWarn || comparableWarn
+    ? "WARN"
+    : "PASS";
 
 function fmtUsage(usage) {
   return `input ${usage.input} · output ${usage.output} · cache-read ${usage.cacheRead} · cache-write ${usage.cacheWrite} · total ${usage.totalTokens}`;
@@ -115,27 +134,39 @@ function fmtPct(value) {
 function fmtContext(value) {
   if (!value) return "unavailable";
   const usage = value.usage;
-  const tokens = usage?.tokens ?? "unknown";
+  const rawTokens = Number(usage?.tokens ?? NaN);
   const window = usage?.contextWindow ?? "unknown";
-  return `${tokens}/${window} tokens · system ${value.systemPromptBytes ?? "?"} B · active tools ${value.activeToolNames?.length ?? "?"} · tool defs ${value.activeToolDefinitionBytes ?? "?"} B`;
+  const preRequest = Number.isFinite(rawTokens) && rawTokens > 0
+    ? `${rawTokens}/${window} pre-request tokens`
+    : "pre-request token estimate unavailable before first provider call";
+  const subagentDefs = value.piSubagentsActiveToolDefinitionBytes ?? "?";
+  const subagentNames = Array.isArray(value.piSubagentsActiveToolNames) ? value.piSubagentsActiveToolNames.join(", ") : "?";
+  return `${preRequest} · system ${value.systemPromptBytes ?? "?"} B · all active tools ${value.activeToolNames?.length ?? "?"} / defs ${value.activeToolDefinitionBytes ?? "?"} B · pi-subagents defs ${subagentDefs} B (${subagentNames}) · wait active ${value.subagentWaitActive === true ? "yes" : "no"}`;
+}
+function fenced(value) {
+  const text = Array.isArray(value) ? value.join("\n") : String(value ?? "");
+  return text.trim() ? `\n\`\`\`text\n${text.trim()}\n\`\`\`\n` : "\n(none)\n";
 }
 
 const scenarioRows = Object.entries(metrics.scenarios).map(([name, pass]) => `| ${name} | ${pass ? "PASS" : "FAIL"} |`).join("\n");
-const report = `# pi-subagents benchmark v2 — ${runId}\n\n`
+const dirtyDetails = meta.repoDirty
+  ? `\n### Dirty worktree warning\n\nThis run is not a clean-commit baseline. Status:${fenced(meta.repoStatus)}\nDiff stat:${fenced(meta.repoDiffStat)}\n`
+  : "";
+const report = `# pi-subagents benchmark v${meta.benchmarkVersion} — ${runId}\n\n`
 + `Overall: **${overall}**  \nDeterministic: **${metrics.deterministicPass && postReviewCompactPass ? "PASS" : "FAIL"}**  \nScenarios: **${metrics.scenarioPassed}/${metrics.scenarioTotal} core/probe + post-review compact ${postReviewCompactPass ? "PASS" : "FAIL"}**\n\n`
-+ `## Environment\n\n| Field | Value |\n|---|---|\n| Benchmark | v${meta.benchmarkVersion} |\n| pi-subagents | ${meta.packageVersion} |\n| Commit | \`${meta.commit}\` |\n| Branch | ${meta.branch} |\n| Repo dirty | ${meta.repoDirty} |\n| Pi | ${meta.piVersion} |\n| Provider/model | ${metrics.provider}/${metrics.model} |\n| Node | ${meta.nodeVersion} |\n| Platform | ${meta.platform} |\n| Session | \`${metrics.sessionPath}\` |\n\n`
++ `## Environment\n\n| Field | Value |\n|---|---|\n| Benchmark | v${meta.benchmarkVersion} |\n| pi-subagents | ${meta.packageVersion} |\n| Commit | \`${meta.commit}\` |\n| Branch | ${meta.branch} |\n| Repo dirty | ${meta.repoDirty ? "YES — warning" : "no"} |\n| Pi | ${meta.piVersion} |\n| Provider/model | ${metrics.provider}/${metrics.model} |\n| Node | ${meta.nodeVersion} |\n| Platform | ${meta.platform} |\n| Session | \`${metrics.sessionPath}\` |\n${dirtyDetails}\n`
 + `## Deterministic checks\n\n| Scenario | Result |\n|---|---|\n${scenarioRows}\n| postReviewCompact | ${postReviewCompactPass ? "PASS" : "FAIL"} |\n\n`
-+ `## Clean starting context\n\n- Probe: ${fmtUsage(metrics.cleanProbeUsage)}\n- Estimated clean context: ${fmtContext(metrics.cleanContext)}\n\n`
++ `## Clean starting context\n\n- Probe (actual first provider request): ${fmtUsage(metrics.cleanProbeUsage)}\n- Pre-request snapshot: ${fmtContext(metrics.cleanContext)}\n- Pi-subagents active tool-definition bytes: ${metrics.cleanContext?.piSubagentsActiveToolDefinitionBytes ?? "unavailable"}\n\n`
 + `## Context surface\n\n| Metric | Value |\n|---|---:|\n| Minimal schema | ${metrics.static.minimalSchemaBytes} bytes |\n| Full schema | ${metrics.static.fullSchemaBytes} bytes |\n| Minimal/full | ${(metrics.static.minimalToFullRatio * 100).toFixed(2)}% |\n| Minimal fields | ${metrics.static.minimalFieldCount} |\n| Full fields | ${metrics.static.fullFieldCount} |\n| Minimal description | ${metrics.static.minimalDescriptionBytes} bytes |\n| Capability schema | ${metrics.static.capabilitySchemaBytes} bytes |\n\n`
 + `## Measured core\n\n- Parent: ${fmtUsage(metrics.parentUsage)}\n- Nested subagents: ${fmtUsage(metrics.nestedSubagentUsage)}\n- Core wall time: ${(metrics.coreWallMs / 1000).toFixed(1)}s\n- Capability sequence: \`${metrics.toolDiscipline.capabilitySequence.join(" → ")}\`\n- Extra core subagent calls: ${metrics.toolDiscipline.extraSubagentCalls}\n- Nested usage evidence: ${metrics.nestedUsageEvidence.syncUsageSources} sync aggregate(s), ${metrics.nestedUsageEvidence.asyncJsonlPaths.length} async JSONL path(s)\n\n`
-+ `## Comparable previous v2 run\n\n${comparison ? `Previous: \`${comparison.runId}\`\n\n| Metric | Delta |\n|---|---:|\n| Minimal schema bytes | ${fmtPct(comparison.minimalSchemaBytesPct)} |\n| Clean probe tokens | ${fmtPct(comparison.cleanProbeTotalTokensPct)} |\n| Core parent tokens | ${fmtPct(comparison.coreParentTotalTokensPct)} |\n| Nested subagent tokens | ${fmtPct(comparison.nestedSubagentTotalTokensPct)} |\n| Core wall time | ${fmtPct(comparison.coreWallMsPct)} |` : "No prior run with the same benchmark version, Pi version, provider, and model."}\n\n`
++ `## Comparable previous v${meta.benchmarkVersion} run\n\n${comparison ? `Previous: \`${comparison.runId}\`\n\n| Metric | Delta |\n|---|---:|\n| Minimal schema bytes | ${fmtPct(comparison.minimalSchemaBytesPct)} |\n| Clean probe tokens | ${fmtPct(comparison.cleanProbeTotalTokensPct)} |\n| Core parent tokens | ${fmtPct(comparison.coreParentTotalTokensPct)} |\n| Nested subagent tokens | ${fmtPct(comparison.nestedSubagentTotalTokensPct)} |\n| Core wall time | ${fmtPct(comparison.coreWallMsPct)} |` : "No prior successful run with the same benchmark version, Pi version, provider, and model."}\n\n`
 + `## Independent reviews\n\n### Efficiency — ${efficiencyReview.verdict}\n\n${efficiencyReview.text}\n\n### Correctness — ${correctnessReview.verdict}\n\n${correctnessReview.text}\n`;
 const reportPath = path.join(runDir, "report.md");
 fs.writeFileSync(reportPath, report);
 
 const resultsPath = path.join(resultsRoot, "RESULTS.md");
 fs.mkdirSync(resultsRoot, { recursive: true });
-const v2Header = `# pi-subagents benchmark results\n\nv2 separates the clean-context probe from the benchmark workload. Token/time comparisons are meaningful only between comparable v2 environments.\n\n## Benchmark v2\n\n| Date | Run | pkg | commit | Pi | model | clean probe | clean ctx | minimal/full | core parent | nested | scenarios | review E/C | wall | status | report |\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---|\n<!-- BENCHMARK_V2_ROWS -->\n`;
+const v2Header = `# pi-subagents benchmark results\n\nv2 separates the clean-context probe from the benchmark workload. Token/time comparisons are meaningful only between comparable successful v2 environments.\n\n## Benchmark v2\n\n| Date | Run | pkg | commit | Pi | model | clean probe | clean ctx | minimal/full | core parent | nested | scenarios | review E/C | wall | status | report |\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---|\n<!-- BENCHMARK_V2_ROWS -->\n`;
 
 if (!fs.existsSync(resultsPath)) {
   fs.writeFileSync(resultsPath, v2Header);
@@ -150,8 +181,9 @@ if (!fs.existsSync(resultsPath)) {
 let results = fs.readFileSync(resultsPath, "utf8");
 if (!results.includes(`| ${runId} |`)) {
   const date = meta.startedAt.slice(0, 10);
-  const cleanCtxTokens = metrics.cleanContext?.usage?.tokens ?? "n/a";
-  const row = `| ${date} | ${runId} | ${meta.packageVersion} | ${String(meta.commit).slice(0, 8)} | ${meta.piVersion} | ${metrics.provider}/${metrics.model} | ${metrics.cleanProbeUsage.totalTokens} | ${cleanCtxTokens} | ${metrics.static.minimalSchemaBytes}/${metrics.static.fullSchemaBytes} (${(metrics.static.minimalToFullRatio * 100).toFixed(1)}%) | ${metrics.parentUsage.totalTokens} | ${metrics.nestedSubagentUsage.totalTokens} | ${metrics.scenarioPassed}/${metrics.scenarioTotal}+${postReviewCompactPass ? "1" : "0"} | ${efficiencyReview.verdict}/${correctnessReview.verdict} | ${(metrics.coreWallMs / 1000).toFixed(1)}s | **${overall}** | [report](runs/${runId}/report.md) |\n`;
+  const rawCleanCtxTokens = Number(metrics.cleanContext?.usage?.tokens ?? NaN);
+  const cleanCtxDisplay = Number.isFinite(rawCleanCtxTokens) && rawCleanCtxTokens > 0 ? rawCleanCtxTokens : "see probe";
+  const row = `| ${date} | ${runId} | ${meta.packageVersion} | ${String(meta.commit).slice(0, 8)} | ${meta.piVersion} | ${metrics.provider}/${metrics.model} | ${metrics.cleanProbeUsage.totalTokens} | ${cleanCtxDisplay} | ${metrics.static.minimalSchemaBytes}/${metrics.static.fullSchemaBytes} (${(metrics.static.minimalToFullRatio * 100).toFixed(1)}%) | ${metrics.parentUsage.totalTokens} | ${metrics.nestedSubagentUsage.totalTokens} | ${metrics.scenarioPassed}/${metrics.scenarioTotal}+${postReviewCompactPass ? "1" : "0"} | ${efficiencyReview.verdict}/${correctnessReview.verdict} | ${(metrics.coreWallMs / 1000).toFixed(1)}s | **${overall}** | [report](runs/${runId}/report.md) |\n`;
   results = results.replace("<!-- BENCHMARK_V2_ROWS -->", `${row}<!-- BENCHMARK_V2_ROWS -->`);
   fs.writeFileSync(resultsPath, results);
 }
@@ -163,6 +195,7 @@ process.stdout.write(`${JSON.stringify({
   scenarios: `${metrics.scenarioPassed}/${metrics.scenarioTotal}+post-review:${postReviewCompactPass ? "pass" : "fail"}`,
   cleanProbeUsage: metrics.cleanProbeUsage,
   cleanContext: metrics.cleanContext,
+  piSubagentsActiveToolDefinitionBytes: metrics.cleanContext?.piSubagentsActiveToolDefinitionBytes ?? null,
   minimalSchemaBytes: metrics.static.minimalSchemaBytes,
   fullSchemaBytes: metrics.static.fullSchemaBytes,
   minimalToFullRatio: metrics.static.minimalToFullRatio,
@@ -171,6 +204,7 @@ process.stdout.write(`${JSON.stringify({
   coreWallMs: metrics.coreWallMs,
   capabilitySequence: metrics.toolDiscipline.capabilitySequence,
   extraSubagentCalls: metrics.toolDiscipline.extraSubagentCalls,
+  repoDirty: meta.repoDirty,
   efficiencyReview: efficiencyReview.verdict,
   correctnessReview: correctnessReview.verdict,
   resultsPath,
