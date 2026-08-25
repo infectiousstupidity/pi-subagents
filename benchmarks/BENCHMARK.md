@@ -13,7 +13,7 @@ This benchmark intentionally does not test coding quality, filesystem editing, a
 - The parent orchestrates only. Do not solve child tasks yourself.
 - **Fail forward:** if a benchmark call fails, continue to the next phase. Do not retry, inspect, repair, or diagnose during the measured core.
 - Do not load advanced controls before Phase 3.
-- Use the exact markers and generated workflowScript below. The collector uses the saved Pi JSONL session as evidence.
+- Use the exact markers and generated workflowScript below. Markers keep outputs short and make calls easy to locate; PASS/FAIL uses runtime result state rather than exact model wording.
 - The intended budget is **4 parent `subagent` calls and 5 child runs total**.
 
 Generated results belong under `~/.pi/benchmarks/pi-subagents/`, not in the repository.
@@ -123,13 +123,13 @@ node benchmarks/scripts/collect-session.mjs <runId>
 
 Do not diagnose failures before collection. The collector checks:
 
-- clean probe,
+- that the clean probe completed and produced usage,
 - compact/full static surface,
-- single delegation,
-- parallel `calls[]`,
+- successful single delegation,
+- successful parallel `calls[]`,
 - advanced workflow execution,
 - advanced → minimal restoration,
-- async + wait,
+- async completion observed through wait,
 - final minimal restoration,
 - exact capability sequence,
 - unexpected/retry subagent calls.
@@ -161,7 +161,7 @@ Finish by reporting only:
 Hard failure:
 
 - any deterministic scenario fails,
-- clean probe is not exactly `BENCH_PROBE_OK`,
+- clean probe response/usage cannot be found,
 - minimal schema is >= 3,500 bytes,
 - minimal schema is >= 25% of full schema,
 - `calls[]` is unavailable,
@@ -180,6 +180,7 @@ Warning:
 
 Informational only — never changes status:
 
+- exact child wording,
 - clean probe token variation,
 - parent token variation,
 - nested child token variation,
