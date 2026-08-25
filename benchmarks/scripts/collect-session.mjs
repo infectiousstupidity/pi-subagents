@@ -45,6 +45,10 @@ function normalizedUsage(usage) {
   out.totalTokens = Number(usage.totalTokens ?? (out.input + out.output + out.cacheRead + out.cacheWrite));
   return out;
 }
+function promptTokens(usage) {
+  const value = normalizedUsage(usage);
+  return value.input + value.cacheRead + value.cacheWrite;
+}
 function addUsage(target, usage) {
   const value = normalizedUsage(usage);
   for (const key of Object.keys(target)) target[key] += value[key];
@@ -163,10 +167,16 @@ for (let i = 0; i < entries.length; i += 1) {
   if (message?.role === "toolResult") toolResults.set(message.toolCallId, message);
 }
 
-const probeAssistant = assistantEntries.find((item) => item.index > probeUserIndex && item.index < benchmarkUserIndex)?.entry?.message;
+const probeAssistantEntries = assistantEntries.filter((item) => item.index > probeUserIndex && item.index < benchmarkUserIndex);
+const probeAssistant = probeAssistantEntries[0]?.entry?.message;
 if (!probeAssistant) throw new Error("Could not find clean probe assistant response.");
+const cleanProbeToolCalls = probeAssistantEntries.flatMap((item) =>
+  (item.entry?.message?.content ?? []).filter((part) => part?.type === "toolCall").map((part) => part.name ?? "unknown")
+);
+const cleanProbeToolFree = probeAssistantEntries.length === 1 && cleanProbeToolCalls.length === 0;
 const cleanProbeText = messageText(probeAssistant).trim();
 const cleanProbeUsage = normalizedUsage(probeAssistant.usage);
+const cleanPromptTokens = promptTokens(probeAssistant.usage);
 
 const callText = (call) => JSON.stringify(call.args ?? {});
 const resultMessage = (call) => toolResults.get(call?.id);
@@ -210,7 +220,7 @@ const finalMinimalPass = sameMinimalSurface(finalSurface, initialSurface);
 const staticMetrics = JSON.parse(fs.readFileSync(path.join(runDir, "static.json"), "utf8"));
 const expectedWorkflowScript = String(meta.workflowScript ?? "").trim();
 const scenarios = {
-  cleanProbe: Boolean(probeAssistant),
+  cleanProbe: cleanProbeToolFree,
   staticSurface: Boolean(staticMetrics.pass && initialSurface && !initialSurface.subagentWaitActive),
   single: Boolean(single && single.args.async === false && !single.args.workflowScript && !single.args.calls && successfulForegroundCall(resultMessage(single), 1)),
   parallel: Boolean(parallel && parallel.args.async === false && Array.isArray(parallel.args.calls) && parallel.args.calls.length === 2 && successfulForegroundCall(resultMessage(parallel), 2)),
@@ -257,6 +267,12 @@ const metrics = {
   cleanContext,
   cleanProbeText,
   cleanProbeUsage,
+  cleanPromptTokens,
+  cleanProbe: {
+    assistantMessages: probeAssistantEntries.length,
+    toolCalls: cleanProbeToolCalls,
+    toolFree: cleanProbeToolFree,
+  },
   parentUsage,
   nestedSubagentUsage,
   coreWallMs: Math.max(0, meta.coreEndedAtMs - meta.startedAtMs),
@@ -294,12 +310,14 @@ process.stdout.write(`${JSON.stringify({
   runId,
   deterministicPass: metrics.deterministicPass,
   scenarios: `${scenarioPassed}/${scenarioTotal}`,
+  cleanPromptTokens,
+  cleanProbeOutputTokens: cleanProbeUsage.output,
+  cleanProbeToolFree,
   piSubagentsModelFacingBytes: initialSurface?.piSubagentsModelFacingToolDefinitionBytes ?? null,
   minimalSchemaBytes: staticMetrics.minimalSchemaBytes,
   fullSchemaBytes: staticMetrics.fullSchemaBytes,
   capabilitySequence,
   extraSubagentCalls,
-  cleanProbeUsage,
   parentUsage,
   nestedSubagentUsage,
   coreWallMs: metrics.coreWallMs,
