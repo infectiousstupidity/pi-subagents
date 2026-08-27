@@ -102,6 +102,15 @@ describe("PI_CODING_AGENT_DIR runtime paths", () => {
 		assert.equal(config.artifactConfig?.cleanupDays, Number.MAX_SAFE_INTEGER);
 	});
 
+	it("requires a pruning model when pruned fork mode is enabled", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ forkContext: { mode: "pruned" } }));
+		assert.throws(() => loadConfig(), /forkContext\.model is required/);
+
+		writeFile(configPath, JSON.stringify({ forkContext: { mode: "pruned", model: "openai-codex/gpt-5.6-luna:max" } }));
+		assert.deepEqual(loadConfig().forkContext, { mode: "pruned", model: "openai-codex/gpt-5.6-luna:max" });
+	});
+
 	it("discovers user agents, chains, and settings under the configured agent dir", () => {
 		const settingsPath = path.join(agentDir, "settings.json");
 		writeFile(path.join(agentDir, "agents", "env-agent.md"), `---
@@ -147,6 +156,41 @@ Inspect env.
 		);
 		assert.equal(created.isError, false, readText(created));
 		assert.equal(fs.existsSync(path.join(agentDir, "agents", `${createdName}.md`)), true);
+	});
+
+	it("ignores nested .pi and sync-backups agent definitions", () => {
+		const userAgentsDir = path.join(agentDir, "agents");
+		const rootAgentPath = path.join(userAgentsDir, "root-agent.md");
+		writeFile(rootAgentPath, `---
+name: root-agent
+description: Root agent
+---
+
+Use the configured root agent.
+`);
+		const nestedBackupAgentPath = path.join(userAgentsDir, ".pi", "agent", "sync-backups", "20260712-163714", "agents", "stale.md");
+		writeFile(nestedBackupAgentPath, `---
+name: stale
+model: nonexistent/model
+description: Stale backup agent
+---
+
+This definition must not be executable.
+`);
+		const directBackupAgentPath = path.join(userAgentsDir, "sync-backups", "20260712-163714", "agents", "also-stale.md");
+		writeFile(directBackupAgentPath, `---
+name: also-stale
+description: Another stale backup agent
+---
+
+This definition must not be executable either.
+`);
+
+		const discovered = discoverAgentsAll(cwd);
+		assert.ok(discovered.user.find((agent) => agent.name === "root-agent" && agent.filePath === rootAgentPath));
+		assert.equal(discovered.user.some((agent) => agent.name === "stale"), false);
+		assert.equal(discovered.user.some((agent) => agent.name === "also-stale"), false);
+		assert.equal(discovered.user.some((agent) => agent.filePath === nestedBackupAgentPath || agent.filePath === directBackupAgentPath), false);
 	});
 
 	it("resolves user skills, settings skills, and package skills from the configured agent dir", () => {
@@ -213,6 +257,21 @@ Package skill content.
 		assert.equal(fs.existsSync(artifactPath), false);
 	});
 
+	it("records explicit run outcomes without guessing legacy outcomes", () => {
+		const historyPath = path.join(agentDir, "run-history.jsonl");
+		writeFile(historyPath, `${JSON.stringify({ agent: "outcome-agent", task: "[redacted]", ts: 1, status: "error", duration: 1, exit: 143 })}\n`);
+		recordRun("outcome-agent", "failed", 1, 2);
+		recordRun("outcome-agent", "timed out", 1, 3, { timedOut: true });
+		recordRun("outcome-agent", "interrupted", 1, 4, { interrupted: true });
+		recordRun("outcome-agent", "stopped", 1, 5, { stopped: true });
+		recordRun("outcome-agent", "completed", 0, 6);
+		recordRun("outcome-agent", "signalled", 143, 7, { processSignal: "SIGTERM" });
+
+		const history = loadRunsForAgent("outcome-agent");
+		assert.deepEqual(history.map((entry) => entry.outcome), ["stopped", "completed", "stopped", "interrupted", "timed_out", "failed", undefined]);
+		assert.equal(history.at(-1)?.exit, 143);
+	});
+
 	it("resolves configured artifact directory preferences", () => {
 		const sessionFile = path.join(agentDir, "sessions", "session-1", "session.jsonl");
 
@@ -272,6 +331,20 @@ Package skill content.
 		writeFile(configPath, JSON.stringify({ artifactDir: "workspace" }));
 
 		assert.throws(() => updateConfig((config) => config), /config\.artifactDir must be "project", "session", or "temp"/);
+	});
+
+	it("loads and validates abandoned async capacity cleanup policy", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: 600_000 } }));
+		assert.equal(loadConfig().capacity?.abandonedSlotReleaseAfterMs, 600_000);
+
+		writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: false } }));
+		assert.equal(loadConfig().capacity?.abandonedSlotReleaseAfterMs, false);
+
+		for (const invalid of [299_999, 86_400_001, 0, "600000", null]) {
+			writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: invalid } }));
+			assert.throws(() => updateConfig((config) => config), /config\.capacity\.abandonedSlotReleaseAfterMs must be false or an integer/);
+		}
 	});
 
 	it("loads and validates Fleet keybinding config", () => {

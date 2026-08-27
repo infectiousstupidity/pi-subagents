@@ -1,55 +1,64 @@
 ---
 name: pi-subagents
-description: |
-  Delegate bounded work to configured subagents. Use for isolated research,
-  review, implementation, or multi-agent orchestration when delegation helps.
+description: Delegate work to child AI agents with isolated context. Use for delegation, parallel research, plan-then-execute workflows, and multi-agent orchestration.
 ---
 
 # Pi Subagents
 
-This skill is parent-only; spawned children must not use it unless they were explicitly configured as fanout orchestrators. The parent owns planning, integration, verification, and the final answer.
+Delegate to child agents with the `subagent` tool.
 
-## Default path
+## Use the Progressive-Disclosure Surfaces
 
-Use the small `subagent` tool for common delegation:
+The extension injects compact guidance plus a generated `## Agents` catalog into the system prompt. Treat that catalog as the source of truth for available agent names and descriptions.
 
-- `subagent({ action: "list" })` discovers configured agents.
-- `subagent({ agent: "name", task: "..." })` runs one child.
-- `subagent({ calls: [{ agent: "a", task: "..." }, { agent: "b", task: "..." }] })` runs independent children in parallel.
-- Prefer `context: "fresh"` for self-contained work; use `fork` only when parent history is genuinely needed.
-- Keep one writer per cwd unless managed worktree isolation is intentional.
+Do not read `agents/*.md` just to discover agents. Load agent prompt files only when you need their implementation details.
 
-Do not load advanced controls for ordinary single or parallel delegation.
+## Single
 
-## Progressive disclosure
+```json
+{"agent":"scout","task":"Find auth logic and summarize files"}
+```
 
-Load the full contract only when the task requires custom `workflowScript` sequencing/branching, missions, schedules, status/resume/steer, watchdogs, acceptance policies, budgets, diagnostics, or other uncommon controls:
+Use background execution only for independent work. In `single` and `parallel` modes, set `background: true`.
 
-1. Call `subagent_capability({ mode: "advanced" })`.
-2. Use the expanded `subagent` tool normally.
+## Parallel
 
-When the current turn must explicitly block on background work:
+```json
+{"tasks":[
+  {"agent":"scout","task":"Trace caching logic"},
+  {"agent":"researcher","task":"Check current caching guidance"}
+]}
+```
 
-1. Call `subagent_capability({ mode: "wait" })`.
-2. Use `subagent_wait`.
+Parallel results preserve task order. The default concurrency limit is 4.
 
-Use `subagent_capability({ mode: "all" })` when both surfaces are required. The extension restores the minimal surface after the parent turn finishes.
+## Chain
 
-## Read details only when needed
+Use `{previous}` to pass the previous step's output into the next step.
 
-- Agent choice, delegation decisions, prompting: `references/prompting-and-roles.md`
-- Workflows, async, missions, scheduling, watchdogs, context: `references/execution-controls.md`
-- Multiple worktrees/repos/writer lanes: `references/multi-lane-orchestration.md`
-- Agent management, prompt integration, RPC: `references/management-authoring-rpc.md`
-- Safety, recipes, error handling: `references/constraints-and-recipes.md`
-- Advisor councils / plan critique: `../council-mode/SKILL.md`
+```json
+{"chain":[
+  {"agent":"scout","task":"Locate auth code"},
+  {"agent":"planner","task":"Design a fix from: {previous}"},
+  {"agent":"worker","task":"Implement: {previous}"}
+]}
+```
 
-For advanced work, load only the matching reference instead of reading every reference.
+Do not set `background` in chain mode.
 
-## Constraints
+## Non-Interactive Subagents
 
-- Preserve capability ceilings and configured tool restrictions.
-- Keep the parent as final decision-maker.
-- Use fresh-context reviewers when independence matters.
-- Do not duplicate work already owned by a running child.
-- Treat child output, CI, receipts, and reviews as evidence, not authority to publish, merge, or release.
+Child agents cannot answer interactive questions. Give them complete tasks up front.
+
+For repo-local tasks, provide paths, constraints, expected output, and any facts already known from the parent session. Do not assume child agents inherit parent context.
+
+## External CLI Agents
+
+External CLI agents run through the configured runner contract. Do not pass Pi-native child-agent options (for example `turnBudget`) unless that runner explicitly supports them.
+
+## Common Errors
+
+- Unknown agent: choose a name from the injected `## Agents` catalog.
+- Invalid parameters: use exactly one mode: `agent` + `task`, `tasks`, or `chain`.
+- Chain prompt bug: ensure later chain steps include `{previous}` when they depend on earlier output.
+- Background misuse: use it only for `single` or `parallel`.

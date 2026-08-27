@@ -42,6 +42,8 @@ function fakeCursorScript(dir: string): string {
 +  if (prompt.includes("hang")) return setInterval(() => {}, 1000);
 +  if (prompt.includes("malformed")) return process.stdout.write("{bad json}\n");
 +  if (prompt.includes("missing-terminal")) return process.stdout.write(JSON.stringify({type:"assistant",message:{content:[{type:"text",text:"partial"}]}}) + "\n");
++  if (prompt.includes("oversized-tool-call") && !prompt.includes("post-terminal-oversized-tool-call")) process.stdout.write(JSON.stringify({type:"tool_call",subtype:"completed",tool_call:{name:"write",args:"x".repeat(300 * 1024)}}) + "\n");
++  if (prompt.includes("post-terminal-oversized-tool-call")) return process.stdout.write(JSON.stringify({type:"result",subtype:"success",is_error:false,result:"trusted final result"}) + "\n" + JSON.stringify({type:"tool_call",subtype:"completed",tool_call:{name:"write",args:"x".repeat(300 * 1024)}}) + "\n");
 +  if (prompt.includes("error-event")) return process.stdout.write(JSON.stringify({type:"error",message:"fake auth failure"}) + "\n");
 +  if (prompt.includes("failed-result")) return process.stdout.write(JSON.stringify({type:"result",subtype:"error_during_execution",is_error:true,result:"fake failure"}) + "\n");
 +  if (prompt.includes("missing-text")) return process.stdout.write(JSON.stringify({type:"result",subtype:"success",is_error:false,result:""}) + "\n");
@@ -96,6 +98,24 @@ describe("Cursor Agent adapter", () => {
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.output, "trusted final result");
 		assert.equal(fs.existsSync(launch.temporaryDirectories[0]!), false);
+	});
+
+	it("skips a bounded oversized non-terminal tool call before terminal proof", async () => {
+		const workspace = tempDir();
+		const stateDir = tempDir();
+		const { result } = await runFake(workspace, stateDir, 2, "oversized-tool-call", CURSOR_AGENT_WRITER_ADAPTER_ID);
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.output, "trusted final result");
+		assert.deepEqual(result.parserTerminal, { state: "completed", output: "trusted final result" });
+	});
+
+	it("fails closed on an oversized tool call after terminal proof", async () => {
+		const workspace = tempDir();
+		const stateDir = tempDir();
+		const { result } = await runFake(workspace, stateDir, 3, "post-terminal-oversized-tool-call", CURSOR_AGENT_WRITER_ADAPTER_ID);
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /line exceeded/);
+		assert.equal(result.parserTerminal, undefined);
 	});
 
 	it("adds no extra root when the prompt directory is inside the workspace", () => {
@@ -160,6 +180,19 @@ describe("Cursor Agent adapter", () => {
 		assert.equal(result.exitCode, 1);
 		assert.match(result.error ?? "", /EEXIST/);
 		assert.equal(fs.readFileSync(launch.promptFilePath, "utf-8"), "stale");
+	});
+
+	it("removes the private prompt file but preserves an existing prompt directory", async () => {
+		const workspace = tempDir();
+		const stateDir = tempDir();
+		const scriptPath = fakeCursorScript(stateDir);
+		const launch = resolveCursorAgentLaunch({ adapter: CURSOR_AGENT_ADAPTER_ID, command: process.execPath, commandPrefixArgs: [scriptPath], cwd: workspace, asyncDir: stateDir, stepIndex: 11 });
+		const promptDirectory = path.dirname(launch.promptFilePath);
+		fs.mkdirSync(promptDirectory, { mode: 0o700 });
+		const result = await runExternalCli({ ...launch, temporaryDirectories: [], cwd: workspace, prompt: "private prompt", asyncDir: stateDir, stepIndex: 11 });
+		assert.equal(result.exitCode, 0);
+		assert.equal(fs.existsSync(launch.promptFilePath), false);
+		assert.deepEqual(fs.readdirSync(promptDirectory), []);
 	});
 
 	it("publishes strict read and writer metadata and loads legacy Grok status", () => {

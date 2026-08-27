@@ -102,6 +102,25 @@ describe("workflow receipts", () => {
 		assert.ok(serialized.length < 400_000, `receipt metadata unexpectedly large: ${serialized.length}`);
 	});
 
+	it("persists structured partial outcomes for workflows and children", () => {
+		const asyncRoot = tempRoot();
+		const asyncDir = path.join(asyncRoot, "workflow-budget");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const terminalOutcome = { state: "partial" as const, reason: "budget_exhausted" as const };
+		writeWorkflowReceipt(asyncDir, buildWorkflowReceipt({
+			workflowRunId: "workflow-budget",
+			state: "failed",
+			children: [child("first"), child("second", { ok: false, terminalOutcome })],
+			terminalOutcome,
+			createdAt: 10,
+		}));
+		const receipt = readWorkflowReceipt(asyncRoot, "workflow-budget");
+
+		assert.deepEqual(receipt.terminalOutcome, terminalOutcome);
+		assert.deepEqual(receipt.entries.second?.terminalOutcome, terminalOutcome);
+		assert.equal(receipt.entries.first?.terminalOutcome, undefined);
+	});
+
 	it("persists a bounded terminal workflow-child summary without payload data", () => {
 		const trace = Array.from({ length: 64 }, (_, index) => ({ operation: "run" as const, key: `child-${index}`, state: "started" as const }));
 		const started = performance.now();
@@ -145,6 +164,18 @@ describe("workflow receipts", () => {
 	it("rejects a summary bound to a different workflow", () => {
 		const summary = workflowChildSummary({ parentToolCallId: "tool", workflowRunId: "other", workflowState: "completed", inventoryComplete: true });
 		assert.throws(() => buildWorkflowReceipt({ workflowRunId: "workflow-1", state: "complete", children: [], workflowChildren: summary }), /does not match its receipt/);
+	});
+
+	it("rejects non-string workflow-child summary identifiers", () => {
+		const asyncRoot = tempRoot();
+		const asyncDir = path.join(asyncRoot, "workflow-1");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writeWorkflowReceipt(asyncDir, {
+			...buildWorkflowReceipt({ workflowRunId: "workflow-1", state: "complete", children: [] }),
+			workflowChildren: { version: 1, parentToolCallId: 123, workflowRunId: true, inventoryComplete: true, workflowState: "completed", children: [] } as never,
+		});
+
+		assert.throws(() => readWorkflowReceipt(asyncRoot, "workflow-1"), /workflowChildren\.parentToolCallId is invalid/);
 	});
 
 	it("adds bounded external adapter metadata without raw output or handoff content", () => {
@@ -204,6 +235,8 @@ describe("workflow receipts", () => {
 		const asyncDir = path.join(asyncRoot, "workflow-1");
 		fs.mkdirSync(asyncDir, { recursive: true });
 		const receipt = buildWorkflowReceipt({ workflowRunId: "workflow-1", state: "complete", children: [child("advisor")] });
+		receipt.workflowResolution = "settled-awaiting-resume";
+		receipt.recovery = [{ key: "advisor", call: "runs.run", resume: { workflowRunId: "workflow-1", key: "advisor", latest: true }, taskRequired: true }];
 		assert.equal(writeWorkflowReceipt(asyncDir, receipt), workflowReceiptPath(asyncRoot, "workflow-1"));
 		assert.deepEqual(readWorkflowReceipt(asyncRoot, "workflow-1"), receipt);
 		let validations = 0;
@@ -217,6 +250,23 @@ describe("workflow receipts", () => {
 		});
 		assert.equal(runId, "run-advisor");
 		assert.equal(validations, 1);
+		const invalid = { ...receipt, recovery: [{ ...receipt.recovery[0], resume: { workflowRunId: "other", key: "advisor", latest: true } }] };
+		fs.writeFileSync(workflowReceiptPath(asyncRoot, "workflow-1"), JSON.stringify(invalid));
+		assert.throws(() => readWorkflowReceipt(asyncRoot, "workflow-1"), /recovery\[0\] does not identify a resumable entry/);
+	});
+
+	it("explains a missing receipt when workflow status or events remain visible", () => {
+		const asyncRoot = tempRoot();
+		const workflowRunId = "workflow-active";
+		const asyncDir = path.join(asyncRoot, workflowRunId);
+		fs.mkdirSync(asyncDir, { recursive: true });
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: workflowRunId, state: "running" }));
+		fs.writeFileSync(path.join(asyncDir, "events.jsonl"), `${JSON.stringify({ type: "subagent.workflow.child.completed", runId: workflowRunId, childRunId: "run-advisor" })}\n`);
+
+		assert.throws(
+			() => resolveWorkflowReceiptResume({ reference: { workflowRunId, key: "advisor", latest: true }, asyncDirRoot: asyncRoot }),
+			/Workflow receipt 'workflow-active' is not available because the workflow may still be active or terminal receipt writing failed\. Use direct child run IDs from status\/events for direct resume after the normal retained-child checks\./,
+		);
 	});
 
 	it("fails closed for missing, non-resumable, and stale receipt references", () => {

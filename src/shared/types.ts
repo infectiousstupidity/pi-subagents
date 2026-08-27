@@ -14,6 +14,7 @@ import type { AuthorityPolicyConfig } from "../policy/authority.ts";
 import type { ThinkingLevel } from "./model-info.ts";
 import type { GlobalMissionIndexRecord, MissionRecord, MissionStoreConfig } from "../missions/types.ts";
 import type { ExtensionBindings } from "../runs/shared/extension-bindings.ts";
+import type { WorkflowChildPermitContext } from "./workflow-child-permit.ts";
 
 // ============================================================================
 // Basic Types
@@ -75,6 +76,20 @@ export interface WorkflowGraphSnapshot {
 
 export type WorkflowReceiptState = "complete" | "failed" | "paused" | "stopped";
 
+export type WorkflowTerminalResolution = "settled-awaiting-resume" | "failed-child" | "interrupted-child";
+
+export interface WorkflowTerminalOutcome {
+	state: "partial";
+	reason: "budget_exhausted" | "timeout";
+}
+
+export interface WorkflowRecoveryAction {
+	key: string;
+	call: "runs.run";
+	resume: { workflowRunId: string; key: string; latest: true };
+	taskRequired: true;
+}
+
 export interface WorkflowChildSummaryV1 {
 	version: 1;
 	parentToolCallId: string;
@@ -97,6 +112,7 @@ type WorkflowReceiptEntryResumability =
 
 export type WorkflowReceiptEntry = WorkflowReceiptEntryResumability & {
 	key: string;
+	terminalOutcome?: WorkflowTerminalOutcome;
 	agent?: string;
 	requestedContext?: "fresh" | "fork";
 	resolvedContext?: "fresh" | "fork" | "mixed";
@@ -112,6 +128,9 @@ export interface WorkflowReceipt {
 	createdAt: number;
 	entries: Record<string, WorkflowReceiptEntry>;
 	workflowChildren?: WorkflowChildSummaryV1;
+	workflowResolution?: WorkflowTerminalResolution;
+	terminalOutcome?: WorkflowTerminalOutcome;
+	recovery?: WorkflowRecoveryAction[];
 }
 
 export interface SavedOutputReference {
@@ -238,6 +257,8 @@ export interface CompletionBatchConfig {
 
 export interface WaitToolConfigObject {
 	enabled?: boolean;
+	/** Default blocking window for subagent_wait calls that omit timeoutMs. */
+	defaultTimeoutMs?: number;
 }
 
 export type WaitToolConfig = boolean | WaitToolConfigObject;
@@ -347,7 +368,7 @@ export interface AgentContract {
 
 export type ChainGateLayer = "execution" | "acceptance";
 
-export type ExecutionProjectionStatus = "completed" | "failed" | "paused" | "stopped" | "detached";
+export type ExecutionProjectionStatus = "completed" | "failed" | "partial" | "paused" | "stopped" | "detached";
 
 export interface ExecutionProjection {
 	status: ExecutionProjectionStatus;
@@ -374,8 +395,24 @@ export interface FileMutationEffect {
 	evidence?: TrackedMutationEvidence;
 }
 
+export interface SettlementDiagnostic {
+	finalTextPresent: boolean;
+	mutation: {
+		expected: boolean;
+		attempted: boolean;
+		observed: boolean;
+	};
+	requiredOutput?: {
+		kind: "file-only" | "structured";
+		path: string;
+		missing: boolean;
+	};
+	afterCompactionSettlement?: boolean;
+}
+
 export interface EffectsProjection {
 	fileMutation?: FileMutationEffect;
+	settlementDiagnostic?: SettlementDiagnostic;
 }
 
 export interface TrackedMutationSnapshot {
@@ -601,12 +638,15 @@ export interface SteeringRecoveryDescriptor {
 	thinking?: string;
 	thinkingCeiling?: ThinkingLevel;
 	tools?: string[];
+	allowNestedSubagents?: boolean;
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
+	mutationTools?: string[];
 	systemPrompt?: string;
 	systemPromptMode: "append" | "replace";
 	inheritProjectContext: boolean;
+	inheritGlobalContext: boolean;
 	inheritSkills: boolean;
 	skills?: string[];
 	skillPath?: string[];
@@ -1135,6 +1175,12 @@ export interface Details {
 	 * identity never reaches tool_result details.
 	 */
 	completions?: WaitCompletion[];
+	wait?: {
+		reason: "window_elapsed";
+		timedOut: true;
+		activeRunIds: string[];
+		activeProviderItems: Array<{ provider: string; id: string }>;
+	};
 	controlEvents?: ControlEvent[];
 	steering?: SteerActionResult;
 	asyncId?: string;
@@ -1144,7 +1190,6 @@ export interface Details {
 	deadlineAt?: number;
 	timedOut?: boolean;
 	stopped?: boolean;
-	turnBudget?: ResolvedTurnBudget;
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetState;
 	progress?: AgentProgress[];
@@ -1260,7 +1305,7 @@ export interface AsyncParallelGroupStatus {
 	stepIndex: number;
 }
 
-export type NestedRunState = "queued" | "running" | "complete" | "failed" | "paused" | "stopped" | "rejected";
+export type NestedRunState = "queued" | "running" | "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 export type NestedOwnerState = "live" | "gone" | "unknown";
 
 export interface NestedRunAddress {
@@ -1274,7 +1319,7 @@ export interface NestedRunAddress {
 
 export interface NestedStepSummary {
 	agent: string;
-	status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "stopped" | "rejected";
+	status: "pending" | "running" | "complete" | "completed" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 	model?: string;
 	thinking?: string;
 	sessionFile?: string;
@@ -1519,7 +1564,7 @@ export interface AsyncStatus {
 	mode: SubagentRunMode;
 	context?: "fresh" | "fork" | "mixed";
 	isNested?: boolean;
-	state: "queued" | "running" | "complete" | "failed" | "paused" | "stopped" | "rejected";
+	state: "queued" | "running" | "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 	/** Display-only dismissal marker for a reload-orphaned workflow. */
 	displayDismissedAt?: number;
 	error?: string;
@@ -1588,7 +1633,7 @@ export interface AsyncStatus {
 		parentWorkflowRunId?: string;
 		outputName?: string;
 		structured?: boolean;
-		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "stopped" | "rejected";
+		status: "pending" | "running" | "complete" | "completed" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 		stopRequested?: boolean;
 		stopRequestedAt?: number;
 		children?: NestedRunSummary[];
@@ -1621,6 +1666,7 @@ export interface AsyncStatus {
 		skills?: string[];
 		model?: string;
 		thinking?: string;
+		contextLimit?: number;
 		thinkingCeiling?: ThinkingLevel;
 		attemptedModels?: string[];
 		modelAttempts?: ModelAttempt[];
@@ -1668,7 +1714,7 @@ export interface AsyncJobState {
 	cwd?: string;
 	/** Parent-resolved child session root retained for trusted live transcript lookup. */
 	sessionRoot?: string;
-	status: "queued" | "running" | "complete" | "failed" | "paused" | "stopped" | "rejected";
+	status: "queued" | "running" | "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 	/** Short caller-facing task/goal shown in fleet surfaces when available. */
 	description?: string;
 	pid?: number;
@@ -2013,6 +2059,8 @@ export interface SubagentChildStatusEvent {
 // ============================================================================
 
 export interface RunSyncOptions {
+	/** Exact discovery provenance for an unknown-agent error; omission uses defensive fallback discovery. */
+	unknownAgentDiagnosticContext?: import("../agents/agents.ts").UnknownAgentDiagnosticContext;
 	/** Opt-in global permission rules; missing tools remain allowed. */
 	permissions?: import("../runs/shared/permissions.ts").PermissionConfig;
 	/** Session id of the direct parent session for permission-system ask forwarding. */
@@ -2024,6 +2072,8 @@ export interface RunSyncOptions {
 	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	cwd?: string;
+	/** Original cwd input retained for launch diagnostics. */
+	requestedCwd?: string;
 	signal?: AbortSignal;
 	interruptSignal?: AbortSignal;
 	timeoutMs?: number;
@@ -2032,10 +2082,7 @@ export interface RunSyncOptions {
 	toolTimeoutMs?: number;
 	/** Raw global config.toolTimeoutMs, used by the per-child resolver. */
 	configToolTimeoutMs?: number;
-	turnBudget?: ResolvedTurnBudget;
 	usageBudget?: UsageBudgetConfig;
-	/** Enforce maxTurns + graceTurns as a hard model-turn boundary. */
-	enforceHardTurnLimit?: boolean;
 	toolBudget?: ResolvedToolBudget;
 	allowZeroToolBudget?: boolean;
 	allowIntercomDetach?: boolean;
@@ -2064,6 +2111,8 @@ export interface RunSyncOptions {
 	maxSubagentDepth?: number;
 	/** Effective parent wait-tool setting propagated to the child runtime. */
 	waitToolEnabled?: boolean;
+	/** Effective parent default wait window propagated to the child runtime. */
+	waitToolDefaultTimeoutMs?: number;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	nestedRoute?: NestedRouteInfo;
@@ -2079,10 +2128,14 @@ export interface RunSyncOptions {
 	thinkingOverride?: AgentConfig["thinking"];
 	thinkingCeiling?: ThinkingLevel;
 	extensionBindings?: ExtensionBindings;
+	/** Package-internal one-use authorization for one foreground workflow child. */
+	workflowChildPermitLaunch?: WorkflowChildPermitContext;
 	/** Registry models available for heuristic bare-model resolution */
-	availableModels?: Array<{ provider: string; id: string; fullId: string }>;
+	availableModels?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */
 	preferredModelProvider?: string;
+	/** Parent Pi event host used to snapshot runtime-registered MCP servers before child launch. */
+	runtimeSnapshotHost?: import("../runs/shared/mcp-direct-tool-allowlist.ts").McpRuntimeSnapshotHost;
 	/** Optional subagent model-scope enforcement for fallback candidates */
 	modelScope?: ModelScopeRule | ModelScopeRule[];
 	/** Skills to make available (overrides agent default if provided) */
@@ -2183,10 +2236,24 @@ export interface MainWindowRendererConfig {
 	compactResultMaxLines?: number;
 }
 
+export interface ForkContextConfig {
+	/** Keep the complete fork by default, or summarize large text-only tool results before launch. */
+	mode?: "full" | "pruned";
+	/** Required pruning model when mode is "pruned". */
+	model?: string;
+}
+
+export interface ActiveAsyncCapacityConfig {
+	/** Reclaim failed runner slots after this age when process proof is unknown; false keeps strict retention. */
+	abandonedSlotReleaseAfterMs?: number | false;
+}
+
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
 	/** Set the context for launches that omit an explicit context. */
 	defaultSubagentContext?: "fresh" | "fork";
+	/** Configure how every resolved fork session is prepared before child spawn. */
+	forkContext?: ForkContextConfig;
 	/** Optional shortcut that detaches the active foreground single-subagent run. */
 	foregroundDetachShortcut?: string;
 	/** Show the Claude Code-style navigable fleet. Defaults to true. */
@@ -2218,6 +2285,8 @@ export interface ExtensionConfig {
 	maxSubagentSpawnsPerRun?: number;
 	/** Optional active top-level async run cap per parent session. Unset or 0 means unlimited. */
 	maxActiveAsyncRunsPerSession?: number;
+	/** Active-capacity cleanup policy. */
+	capacity?: ActiveAsyncCapacityConfig;
 	/** Global cap on simultaneously-running subagent tasks within a single run. Defaults to 20. */
 	globalConcurrencyLimit?: number;
 	/**
@@ -2241,7 +2310,6 @@ export interface ExtensionConfig {
 	toolTimeoutMs?: number;
 	control?: ControlConfig;
 	completionBatch?: CompletionBatchConfig;
-	turnBudget?: TurnBudgetConfig;
 	toolBudget?: ToolBudgetConfig;
 	/** Opt-in native tool permissions. Bash remains outside this policy. */
 	permissions?: import("../runs/shared/permissions.ts").PermissionConfig;

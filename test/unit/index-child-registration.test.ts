@@ -635,9 +635,13 @@ describe("subagent extension child mode", () => {
 			const handlers = new Map();
 			const events = { on(channel, handler) { eventHandlers.set(channel, handler); return () => {}; }, emit() {} };
 			const widgets = [];
+			const herdrCommands = [];
+			process.env.HERDR_ENV = "1";
+			process.env.HERDR_PANE_ID = "w1:p1";
 			const fakePi = new Proxy({
 				events,
 				on(channel, handler) { handlers.set(channel, handler); },
+				exec(command, args) { herdrCommands.push({ command, args }); return Promise.resolve({ code: 0, stdout: "", stderr: "", killed: false }); },
 				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 				sendMessage() {}, getSessionName() { return undefined; },
 			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
@@ -663,6 +667,10 @@ describe("subagent extension child mode", () => {
 			handlers.get("tool_result")({ toolName: "subagent" }, ctx);
 			const fleetWidgets = widgets.filter((entry) => entry.key === "subagent-fleet-status");
 			if (!fleetWidgets.some((entry) => typeof entry.value === "function")) throw new Error("management result did not restore active fleet status: " + JSON.stringify(fleetWidgets));
+			if (!herdrCommands.some(({ args }) => args.includes("summary=⏳ 1 subagent"))) throw new Error("management result did not restore Herdr status: " + JSON.stringify(herdrCommands));
+			const herdrCommandCount = herdrCommands.length;
+			handlers.get("tool_result")({ toolName: "subagent" }, ctx);
+			if (herdrCommands.length !== herdrCommandCount) throw new Error("unchanged active jobs redundantly refreshed Herdr status: " + JSON.stringify(herdrCommands));
 			handlers.get("session_shutdown")();
 			fs.rmSync(asyncDir, { recursive: true, force: true });
 		`;
@@ -990,6 +998,58 @@ describe("subagent extension child mode", () => {
 				["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script],
 				{ cwd: projectRoot, env, stdio: "pipe" },
 			);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("claims the explicit predecessor session during session replacement", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-session-transition-"));
+		const configDir = path.join(agentDir, "extensions", "subagent");
+		fs.mkdirSync(configDir, { recursive: true });
+		fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ completionBatch: { enabled: false } }), "utf-8");
+		const script = String.raw`
+			import fs from "node:fs";
+			import path from "node:path";
+			import registerSubagentExtension from "./index.ts";
+			import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+			const handlers = new Map();
+			const listeners = new Map();
+			const events = {
+				on(channel, handler) { let set = listeners.get(channel); if (!set) listeners.set(channel, set = new Set()); set.add(handler); return () => set.delete(handler); },
+				emit(channel, payload) { for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload); },
+			};
+			const sent = [];
+			const pi = new Proxy({
+				events,
+				on(channel, handler) { handlers.set(channel, handler); },
+				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+				sendMessage(message) { sent.push(message); }, getSessionName() { return undefined; },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const sessions = path.join(process.env.PI_CODING_AGENT_DIR, "sessions");
+			fs.mkdirSync(sessions, { recursive: true });
+			const oldSession = path.join(sessions, "old.jsonl");
+			const newSession = path.join(sessions, "new.jsonl");
+			fs.writeFileSync(oldSession, "");
+			fs.writeFileSync(newSession, "");
+			let currentSession = oldSession;
+			const sessionManager = { getSessionId() { return path.basename(currentSession); }, getSessionFile() { return currentSession; }, getEntries() { return []; } };
+			const ctx = { cwd: process.cwd(), hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager, modelRegistry: { getAvailable() { return []; } } };
+			registerSubagentExtension(pi);
+			handlers.get("session_start")({ reason: "startup" }, ctx);
+			currentSession = newSession;
+			handlers.get("session_start")({ reason: "new", previousSessionFile: oldSession }, ctx);
+			const owner = currentCompletionOwnerId();
+			events.emit("subagent:async-complete", { id: "old-owned", agent: "worker", success: true, summary: "old", timestamp: 1, sessionId: oldSession, completionOwnerId: owner });
+			events.emit("subagent:async-complete", { id: "foreign", agent: "worker", success: true, summary: "foreign", timestamp: 2, sessionId: path.join(sessions, "foreign.jsonl"), completionOwnerId: owner });
+			if (sent.length !== 1) throw new Error("expected only the claimed predecessor completion, got " + sent.length);
+			await handlers.get("session_shutdown")({ reason: "quit" });
+		`;
+
+		try {
+			const env = parentToolEnv();
+			env.PI_CODING_AGENT_DIR = agentDir;
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}

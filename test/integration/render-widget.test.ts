@@ -3,9 +3,10 @@ import { describe, it } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { extractToolArgsPreview } from "../../src/shared/utils.ts";
 
-const { buildWidgetLines, clearLegacyResultAnimationTimer, renderWidget } = await import("../../src/tui/render.ts") as {
+const { buildWidgetLines, clearLegacyResultAnimationTimer, compactTaskText, renderWidget } = await import("../../src/tui/render.ts") as {
 	buildWidgetLines: (jobs: Array<Record<string, unknown>>, theme: { fg(name: string, text: string): string; bold(text: string): string }, width?: number, expanded?: boolean, frame?: number) => string[];
 	clearLegacyResultAnimationTimer: (context: { state: { subagentResultAnimationTimer?: ReturnType<typeof setInterval> } }) => void;
+	compactTaskText: (task: string | undefined, label?: string) => string | undefined;
 	renderWidget: (ctx: Record<string, unknown>, jobs: Array<Record<string, unknown>>) => void;
 };
 
@@ -174,6 +175,66 @@ describe("subagent async widget rendering", () => {
 		assert.match(text, /parallel · 3 agents running/);
 		assert.doesNotMatch(text, /parallel · reviewer ×3/);
 		assert.doesNotMatch(text, /reviewer → reviewer → reviewer/);
+	});
+
+	it("distinguishes same-agent parallel rows with explicit labels", () => {
+		const lines = buildWidgetLines([{
+			asyncId: "run-labels",
+			asyncDir: "/tmp/labels",
+			status: "running",
+			mode: "parallel",
+			agents: ["reviewer", "reviewer"],
+			activeParallelGroup: true,
+			runningSteps: 2,
+			completedSteps: 0,
+			stepsTotal: 2,
+			steps: [
+				{ index: 0, agent: "reviewer", label: "Review auth", description: "private auth task", status: "running" },
+				{ index: 1, agent: "reviewer", label: "Review billing", description: "private billing task", status: "running" },
+			],
+		}, {
+			asyncId: "done",
+			asyncDir: "/tmp/done",
+			status: "complete",
+			mode: "single",
+			agents: ["worker"],
+			startedAt: 0,
+			updatedAt: 1,
+		}], theme, 120);
+
+		const text = lines.join("\n");
+		assert.match(text, /Agent 1\/2: Review auth — private auth task \(reviewer\) · running/);
+		assert.match(text, /Agent 2\/2: Review billing — private billing task \(reviewer\) · running/);
+		assert.equal(compactTaskText("  [prompt redacted]  ", "Review auth"), "Review auth");
+	});
+
+	it("shows peak context usage and falls back to token usage without a limit", () => {
+		const step = {
+			index: 0,
+			agent: "reviewer",
+			status: "running" as const,
+			tokens: { input: 31_000, output: 10_000, total: 44_000, window: 31_000, windowPeak: 32_000 },
+		};
+		const withLimit = buildWidgetLines([{
+			asyncId: "run-context",
+			asyncDir: "/tmp/context",
+			status: "running" as const,
+			mode: "single" as const,
+			agents: ["reviewer"],
+			steps: [{ ...step, contextLimit: 128_000 }],
+		}], theme, 180).join("\n");
+		assert.match(withLimit, /ctx 32k\/128k \(25%\)/);
+
+		const withoutLimit = buildWidgetLines([{
+			asyncId: "run-context-fallback",
+			asyncDir: "/tmp/context-fallback",
+			status: "running" as const,
+			mode: "single" as const,
+			agents: ["reviewer"],
+			steps: [step],
+		}], theme, 180).join("\n");
+		assert.match(withoutLimit, /31k window · 44k spent/);
+		assert.doesNotMatch(withoutLimit, /ctx 32k\/128k/);
 	});
 
 	it("renders a compact component widget for three active parallel agents without core truncation", () => {

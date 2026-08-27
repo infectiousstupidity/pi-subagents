@@ -48,6 +48,7 @@ interface AsyncRunStepSummary {
 	totalCost?: CostSummary;
 	skills?: string[];
 	model?: string;
+	contextLimit?: number;
 	thinking?: string;
 	attemptedModels?: string[];
 	sessionFile?: string;
@@ -76,7 +77,7 @@ export interface AsyncRunSummary {
 	asyncDir: string;
 	toolCallId?: string;
 	sessionId?: string;
-	state: "queued" | "running" | "complete" | "failed" | "paused" | "stopped" | "rejected";
+	state: "queued" | "running" | "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 	error?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
@@ -239,13 +240,21 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	const { activityState, lastActivityAt } = deriveAsyncActivityState(asyncDir, status);
 	const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId })
 		?? sanitizeProcessTerminal(status.processTerminal, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId }, path.join(asyncDir, "status.json"));
-	const runFanoutBudgetDescriptor = readRunFanoutBudgetDescriptor(asyncDir);
-	const runFanoutBudget = runFanoutBudgetDescriptor ? getRunFanoutBudgetSnapshot(runFanoutBudgetDescriptor) : status.runFanoutBudget;
+	const nestedProjectionAllowed = nestedWarnings.length === 0;
+	// Degrade to the status-stored snapshot when the persisted budget is unavailable (e.g. removed
+	// by OS temp cleanup) instead of failing the whole run list; admission paths stay strict.
+	let runFanoutBudget: AsyncStatus["runFanoutBudget"] = status.runFanoutBudget;
+	try {
+		const runFanoutBudgetDescriptor = readRunFanoutBudgetDescriptor(asyncDir);
+		if (runFanoutBudgetDescriptor) runFanoutBudget = getRunFanoutBudgetSnapshot(runFanoutBudgetDescriptor);
+	} catch (error) {
+		nestedWarnings.push(`Run fan-out status unavailable: ${getErrorMessage(error)}`);
+	}
 	const steps = status.steps ?? [];
 	const chainStepCount = status.chainStepCount ?? steps.length;
 	const parallelGroups = normalizeParallelGroups(status.parallelGroups, steps.length, chainStepCount);
 	let nestedChildren: NestedRunSummary[] = [];
-	if (nestedWarnings.length === 0 && nestedRoute) {
+	if (nestedProjectionAllowed && nestedRoute) {
 		try {
 			// The route is resolved by the caller via buildNestedRouteIndex, so this
 			// avoids a fresh scan of the nested-events directory per run.
@@ -287,6 +296,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.totalCost ? { totalCost: step.totalCost } : {}),
 			...(step.skills ? { skills: step.skills } : {}),
 			...(step.model ? { model: step.model } : {}),
+			...(step.contextLimit !== undefined ? { contextLimit: step.contextLimit } : {}),
 			...(step.thinking ? { thinking: step.thinking } : {}),
 			...(step.thinkingCeiling ? { thinkingCeiling: step.thinkingCeiling } : {}),
 			...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
@@ -381,6 +391,7 @@ function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 			case "running": return 0;
 			case "queued": return 1;
 			case "failed": return 2;
+			case "partial": return 2;
 			case "stopped": return 2;
 			case "paused": return 2;
 			case "complete": return 3;

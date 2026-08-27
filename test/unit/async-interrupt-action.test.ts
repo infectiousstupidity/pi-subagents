@@ -694,6 +694,27 @@ describe("async interrupt action", () => {
 		}
 	});
 
+	it("stops a reload-recovered workflow through the durable control channel", async () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-recovered-workflow-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId, { track: false, sessionId: "session", mode: "workflow" });
+		try {
+			const kills: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = [];
+			const result = await executorWithKill(state, (pid, signal) => {
+				kills.push({ pid, signal });
+				return true;
+			}).execute("stop-recovered-workflow", { action: "stop", id: runId }, new AbortController().signal, undefined, ctx());
+
+			assert.equal(result.isError, undefined);
+			assert.match(text(result), new RegExp(`Stop requested for async run ${runId}`));
+			assert.equal(consumeStopRequestPayload(asyncDir)?.type, "stop");
+			assert.deepEqual(kills, [{ pid: 12345, signal: 0 }]);
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
 	it("writes child-scoped stop requests for a running async run", async () => {
 		const state = createState();
 		state.currentSessionId = "session";
@@ -720,6 +741,43 @@ describe("async interrupt action", () => {
 			assert.equal(request?.targetIndex, 1);
 			assert.equal(request?.childId, "review");
 			assert.equal(typeof request?.ts, "number");
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("/subagents-stop rejects a nested-only child without writing a parent target request", async () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-nested-${Date.now().toString(36)}`;
+		const nestedChildId = `${runId}-nested`;
+		const asyncDir = createRunningAsync(state, runId, { track: false, sessionId: "session" });
+		try {
+			const statusPath = path.join(asyncDir, "status.json");
+			writeJson(statusPath, {
+				...JSON.parse(fs.readFileSync(statusPath, "utf-8")),
+				steps: [{
+					agent: "wrapper",
+					status: "running",
+					startedAt: 100,
+					children: [{
+						id: nestedChildId,
+						parentRunId: runId,
+						parentStepIndex: 0,
+						depth: 1,
+						path: [{ runId, stepIndex: 0 }],
+						state: "running",
+					}],
+				}],
+			});
+
+			const result = await executorWithKill(state, () => {
+				throw new Error("nested-only child stop must not signal the parent runner");
+			}).execute("stop-nested", { action: "stop", id: runId, childId: nestedChildId }, new AbortController().signal, undefined, ctx());
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), new RegExp(`Child '${nestedChildId}' was not found under async run '${runId}'`));
+			assert.equal(consumeStopRequestPayload(asyncDir), undefined);
 		} finally {
 			cleanup(runId, asyncDir);
 		}

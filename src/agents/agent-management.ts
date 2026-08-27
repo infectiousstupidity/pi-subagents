@@ -31,9 +31,8 @@ import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
 import { toModelInfo } from "../shared/model-info.ts";
 import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
-import { resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
-import { validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
+import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
 import type { AcceptanceInput, Details, ExtensionConfig, ToolBudgetConfig } from "../shared/types.ts";
 import { getProjectConfigDir } from "../shared/utils.ts";
 import { capabilityCeilingAgentRestrictionSources, isAgentAllowedByCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
@@ -230,6 +229,7 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		thinking: _thinking,
 		systemPromptMode: _systemPromptMode,
 		inheritProjectContext: _inheritProjectContext,
+		inheritGlobalContext: _inheritGlobalContext,
 		inheritSkills: _inheritSkills,
 		defaultContext: _defaultContext,
 		acceptanceRole: _acceptanceRole,
@@ -240,6 +240,7 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		tools: _tools,
 		mcpDirectTools: _mcpDirectTools,
 		subagentOnlyExtensions: _subagentOnlyExtensions,
+		mutationTools: _mutationTools,
 		completionGuard: _completionGuard,
 		...editable
 	} = withoutExtensions;
@@ -260,6 +261,7 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		...(base.thinking !== undefined ? { thinking: base.thinking } : {}),
 		systemPromptMode: base.systemPromptMode,
 		inheritProjectContext: base.inheritProjectContext,
+		inheritGlobalContext: base.inheritGlobalContext,
 		inheritSkills: base.inheritSkills,
 		...(base.defaultContext !== undefined ? { defaultContext: base.defaultContext } : {}),
 		...(base.acceptanceRole !== undefined ? { acceptanceRole: base.acceptanceRole } : {}),
@@ -271,6 +273,7 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		...(base.mcpDirectTools !== undefined ? { mcpDirectTools: [...base.mcpDirectTools] } : {}),
 		...(base.extensions !== undefined ? { extensions: [...base.extensions] } : {}),
 		...(base.subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions: [...base.subagentOnlyExtensions] } : {}),
+		...(base.mutationTools !== undefined ? { mutationTools: [...base.mutationTools] } : {}),
 		...(base.completionGuard !== undefined ? { completionGuard: base.completionGuard } : {}),
 	}, agent.filePath);
 }
@@ -303,6 +306,7 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "skillPath")) changed("skillPath");
 	if (hasKey(cfg, "extensions")) changed("extensions");
 	if (hasKey(cfg, "subagentOnlyExtensions")) changed("subagentOnlyExtensions");
+	if (hasKey(cfg, "mutationTools")) changed("mutationTools");
 	if (hasKey(cfg, "thinking")) {
 		changed("thinking");
 		if (cfg.thinking === "off") fields.add("thinking");
@@ -315,6 +319,10 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 		changed("inheritProjectContext");
 		fields.add("inheritProjectContext");
 	}
+	if (hasKey(cfg, "inheritGlobalContext")) {
+		changed("inheritGlobalContext");
+		fields.add("inheritGlobalContext");
+	}
 	if (hasKey(cfg, "inheritSkills")) {
 		changed("inheritSkills");
 		fields.add("inheritSkills");
@@ -322,7 +330,6 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "defaultContext")) changed("defaultContext");
 	if (hasKey(cfg, "async")) changed("async");
 	if (hasKey(cfg, "timeoutMs")) changed("timeoutMs");
-	if (hasKey(cfg, "turnBudget")) changed("turnBudget");
 	if (hasKey(cfg, "acceptance")) changed("acceptance");
 	if (hasKey(cfg, "acceptanceRole")) changed("acceptanceRole");
 	if (hasKey(cfg, "output")) changed("output");
@@ -379,17 +386,17 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 			if (runner.type === "pi" && Object.keys(runner).every((key) => key === "type")) target.runner = { type: "pi" };
 			else if (runner.type === "external-cli" && typeof runner.command === "string" && runner.command.trim()
 				&& (runner.args === undefined || (Array.isArray(runner.args) && runner.args.every((arg) => typeof arg === "string")))
-				&& (runner.adapter === undefined || runner.adapter === "codex-exec" || runner.adapter === "codex-exec-writer" || runner.adapter === "claude-code" || runner.adapter === "claude-code-writer" || runner.adapter === "cursor-agent" || runner.adapter === "cursor-agent-writer")
+				&& (runner.adapter === undefined || isCodeOwnedExternalCliAdapterId(runner.adapter))
 				&& (runner.adapter === undefined || runner.args === undefined || runner.args.length === 0)
 				&& (runner.promptDelivery === undefined || runner.promptDelivery === "stdin")
 				&& Object.keys(runner).every((key) => ["type", "adapter", "command", "args", "promptDelivery"].includes(key))) {
 				const runnerArgs = Array.isArray(runner.args) ? runner.args.filter((arg): arg is string => typeof arg === "string") : undefined;
-				target.runner = { type: "external-cli", ...(runner.adapter === "codex-exec" || runner.adapter === "codex-exec-writer" || runner.adapter === "claude-code" || runner.adapter === "claude-code-writer" || runner.adapter === "cursor-agent" || runner.adapter === "cursor-agent-writer" ? { adapter: runner.adapter } : {}), command: runner.command.trim(), ...(runnerArgs?.length ? { args: runnerArgs } : {}), ...(runner.promptDelivery ? { promptDelivery: "stdin" } : {}) };
+				target.runner = { type: "external-cli", ...(isCodeOwnedExternalCliAdapterId(runner.adapter) ? { adapter: runner.adapter } : {}), command: runner.command.trim(), ...(runnerArgs?.length ? { args: runnerArgs } : {}), ...(runner.promptDelivery ? { promptDelivery: "stdin" } : {}) };
 			} else if (runner.type === "external-job" && typeof runner.provider === "string" && runner.provider.trim() === runner.provider && runner.provider
 				&& (runner.options === undefined || (runner.options && typeof runner.options === "object" && !Array.isArray(runner.options) && isJsonSerializable(runner.options)))
 				&& Object.keys(runner).every((key) => ["type", "provider", "options"].includes(key))) {
 				target.runner = { type: "external-job", provider: runner.provider, ...(runner.options ? { options: runner.options as Record<string, unknown> } : {}) };
-			} else return "config.runner must be { type: 'pi' }, { type: 'external-cli', adapter?: 'codex-exec' | 'codex-exec-writer' | 'claude-code' | 'claude-code-writer' | 'cursor-agent' | 'cursor-agent-writer', command: string, args?: string[], promptDelivery?: 'stdin' }, or { type: 'external-job', provider: string, options?: object }.";
+			} else return `config.runner must be { type: 'pi' }, { type: 'external-cli', adapter?: ${CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL}, command: string, args?: string[], promptDelivery?: 'stdin' }, or { type: 'external-job', provider: string, options?: object }.`;
 		} else return "config.runner must be an object, false, or empty string when provided.";
 	}
 	if (hasKey(cfg, "model")) {
@@ -457,6 +464,12 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		else if (typeof cfg.subagentOnlyExtensions === "string") target.subagentOnlyExtensions = parseCsv(cfg.subagentOnlyExtensions);
 		else return "config.subagentOnlyExtensions must be a comma-separated string, empty string, or false when provided.";
 	}
+	if (hasKey(cfg, "mutationTools")) {
+		if (cfg.mutationTools === false) delete target.mutationTools;
+		else if (cfg.mutationTools === "") target.mutationTools = [];
+		else if (typeof cfg.mutationTools === "string") target.mutationTools = parseCsv(cfg.mutationTools);
+		else return "config.mutationTools must be a comma-separated string, empty string, or false when provided.";
+	}
 	if (hasKey(cfg, "thinking")) {
 		if (cfg.thinking === false || cfg.thinking === "") delete target.thinking;
 		else if (typeof cfg.thinking === "string") {
@@ -472,6 +485,10 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 	if (hasKey(cfg, "inheritProjectContext")) {
 		if (typeof cfg.inheritProjectContext !== "boolean") return "config.inheritProjectContext must be a boolean when provided.";
 		target.inheritProjectContext = cfg.inheritProjectContext;
+	}
+	if (hasKey(cfg, "inheritGlobalContext")) {
+		if (typeof cfg.inheritGlobalContext !== "boolean") return "config.inheritGlobalContext must be a boolean when provided.";
+		target.inheritGlobalContext = cfg.inheritGlobalContext;
 	}
 	if (hasKey(cfg, "inheritSkills")) {
 		if (typeof cfg.inheritSkills !== "boolean") return "config.inheritSkills must be a boolean when provided.";
@@ -491,15 +508,6 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		if (cfg.timeoutMs === false || cfg.timeoutMs === "") delete target.defaultTimeoutMs;
 		else if (typeof cfg.timeoutMs === "number" && Number.isInteger(cfg.timeoutMs) && cfg.timeoutMs > 0) target.defaultTimeoutMs = cfg.timeoutMs;
 		else return "config.timeoutMs must be a positive integer or false when provided.";
-	}
-	if (hasKey(cfg, "turnBudget")) {
-		if (cfg.turnBudget === false || cfg.turnBudget === "") delete target.defaultTurnBudget;
-		else {
-			const resolved = resolveTurnBudgetConfig(cfg.turnBudget, "config.turnBudget");
-			if (resolved.error) return resolved.error;
-			if (resolved.turnBudget !== undefined) target.defaultTurnBudget = resolved.turnBudget;
-			else delete target.defaultTurnBudget;
-		}
 	}
 	if (hasKey(cfg, "acceptance")) {
 		if (cfg.acceptance === "") delete target.defaultAcceptance;
@@ -561,6 +569,7 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 			target.thinking ? "thinking" : undefined,
 			target.extensions?.length ? "extensions" : undefined,
 			target.subagentOnlyExtensions?.length ? "subagentOnlyExtensions" : undefined,
+			target.mutationTools?.length ? "mutationTools" : undefined,
 			target.skills?.length || target.skillPath?.length ? "skills" : undefined,
 			target.maxSubagentDepth !== undefined ? "maxSubagentDepth" : undefined,
 			target.completionGuard !== undefined ? "completionGuard" : undefined,
@@ -699,16 +708,17 @@ function formatAgentDetail(agent: AgentConfig): string {
 		if (agent.runner?.type === "external-job" && agent.runner.options) lines.push(`Runner options: ${JSON.stringify(agent.runner.options)}`);
 	}
 	lines.push(`Inherit project context: ${agent.inheritProjectContext ? "true" : "false"}`);
+	lines.push(`Inherit global context: ${agent.inheritGlobalContext ? "true" : "false"}`);
 	lines.push(`Inherit skills: ${agent.inheritSkills ? "true" : "false"}`);
 	if (agent.defaultContext) lines.push(`Default context: ${agent.defaultContext}`);
 	if (agent.defaultAsync !== undefined) lines.push(`Async: ${agent.defaultAsync ? "true" : "false"}`);
 	if (agent.defaultTimeoutMs !== undefined) lines.push(`Timeout: ${agent.defaultTimeoutMs}ms`);
-	if (agent.defaultTurnBudget) lines.push(`Turn budget: ${JSON.stringify(agent.defaultTurnBudget)}`);
 	if (agent.defaultAcceptance !== undefined) lines.push(`Acceptance: ${typeof agent.defaultAcceptance === "object" ? JSON.stringify(agent.defaultAcceptance) : String(agent.defaultAcceptance)}`);
 	if (agent.acceptanceRole) lines.push(`Acceptance role: ${agent.acceptanceRole}`);
 	if (agent.source === "builtin") lines.push(`Disabled: ${agent.disabled ? "true" : "false"}`);
 	if (agent.extensions !== undefined) lines.push(`Extensions: ${agent.extensions.length ? agent.extensions.join(", ") : "(none)"}`);
 	if (agent.subagentOnlyExtensions !== undefined) lines.push(`Subagent-only extensions: ${agent.subagentOnlyExtensions.length ? agent.subagentOnlyExtensions.join(", ") : "(none)"}`);
+	if (agent.mutationTools !== undefined) lines.push(`Mutation tools: ${agent.mutationTools.length ? agent.mutationTools.join(", ") : "(none)"}`);
 	if (agent.thinking) lines.push(`Thinking: ${agent.thinking}`);
 	if (agent.output) lines.push(`Output: ${agent.output}`);
 	if (agent.outputMode) lines.push(`Output mode: ${agent.outputMode}`);
@@ -724,7 +734,7 @@ function formatAgentDetail(agent: AgentConfig): string {
 
 export function handleList(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const scope = normalizeListScope(params.agentScope) ?? "both";
-	const d = discoverAgentsAll(ctx.cwd);
+	const d = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
 	let scopedAgents = mergeAgentsForScope(scope, d.user, d.project, d.builtin, d.package);
 	if (ctx.runtimeAgentOwner && listRuntimeAgentConfigs(ctx.runtimeAgentOwner).length > 0) {
 		const configuredAgents: AgentConfig[] = [
@@ -785,15 +795,16 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		return result(`Builtin agent '${requestedAgent}' not found. Available: ${BUILTIN_AGENT_NAMES.join(", ")}.`, true);
 	}
 
-	const discovered = discoverAgentsAll(ctx.cwd);
+	const discovered = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
 	const builtinByName = new Map(discovered.builtin.map((agent) => [agent.name, agent]));
+	const resolveBuiltinModelAgent = (name: string): AgentConfig | undefined => builtinByName.get(name) ?? resolveAgentName(name, discovered.builtin).agent;
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 	const preferredProvider = ctx.model?.provider;
 	const names = requestedAgent ? [requestedAgent] : [...BUILTIN_AGENT_NAMES];
 
 	if (requestedAgent) {
-		const agent = builtinByName.get(requestedAgent);
+		const agent = resolveBuiltinModelAgent(requestedAgent);
 		if (!agent) return result(`Builtin agent '${requestedAgent}' not found.`, true);
 		const resolvedModel = resolveSubagentModelOverride(agent.model, currentModel, availableModels, preferredProvider);
 		const lines = [
@@ -827,7 +838,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 	];
 
 	for (const name of names) {
-		const agent = builtinByName.get(name);
+		const agent = resolveBuiltinModelAgent(name);
 		if (!agent) {
 			lines.push(name);
 			lines.push("  model:");
@@ -863,7 +874,7 @@ function handleGet(params: ManagementParams, ctx: ManagementContext): AgentToolR
 	if (!params.agent) return result("Specify 'agent' for get.", true);
 	const scope = normalizeListScope(params.agentScope);
 	if (!scope) return result("agentScope must be 'user', 'project', or 'both' for get.", true);
-	const discovered = discoverAgentsAll(ctx.cwd);
+	const discovered = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
 	const matches = findAgentsInDiscovery(params.agent, discovered, scope);
 	const diagnostics = diagnosticsForScope(discovered.agentDiagnostics, scope);
 	const rawName = params.agent.trim();
@@ -914,6 +925,7 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 		systemPrompt: "",
 		systemPromptMode: defaultSystemPromptMode(name),
 		inheritProjectContext: defaultInheritProjectContext(name),
+		inheritGlobalContext: false,
 		inheritSkills: defaultInheritSkills(),
 	};
 	const applyError = applyAgentConfig(agent, cfg);

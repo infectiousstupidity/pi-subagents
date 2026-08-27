@@ -32,6 +32,16 @@ When behavior cannot be proven, the system fails closed instead of reporting opt
 Existing primitives come first.
 A new mode, runner, or abstraction is justified only when current primitives cannot honestly express the needed behavior.
 
+## Scope must earn size
+
+Pull requests should be narrow enough to review with confidence.
+A large diff is a warning sign, not proof of rigor.
+Size is acceptable only when the issue, design, and owner approval justify it.
+
+Broad changes need approval before they expand across launch paths, public APIs, persistence, or runner lifecycle code.
+When a proposal touches those surfaces without that approval, the right response is adversarial review and reduction.
+Each PR should prove one clear invariant and stop before it turns into a framework.
+
 ## Performance is a product constraint
 
 Delegation must stay fast enough that one parent session can keep several children moving without the operator waiting on the tool.

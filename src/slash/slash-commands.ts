@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { keyText, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, type Component, type KeyId, type TUI } from "@earendil-works/pi-tui";
-import { BUILTIN_AGENT_NAMES, discoverAgents, discoverAgentsAll, findBlockingAgentDiagnostic, resolveAgentName, type AgentConfig, type AgentDiscoveryDiagnostic, type AgentScope } from "../agents/agents.ts";
+import { BUILTIN_AGENT_NAMES, discoverAgents, discoverAgentsAll, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentDiscoveryDiagnostic, type AgentScope, type UnknownAgentDiagnosticContext } from "../agents/agents.ts";
 import { listRuntimeAgentConfigs, mergeRuntimeAgents } from "../agents/runtime-agent-registry.ts";
 import { resolveExistingReadPaths } from "../shared/settings.ts";
 import {
@@ -22,6 +22,8 @@ import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from
 import { encodeInspectReply, handleInspectRpcArgs, INSPECT_WIDGET_KEY } from "../runs/background/inspect-rpc.ts";
 import { listScheduledRunSummaries } from "../runs/background/scheduled-runs.ts";
 import { SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
+import { resolveAsyncStatusChild } from "../runs/shared/child-identity.ts";
+import { readStatus } from "../shared/utils.ts";
 import { FLEET_OPEN_SHORTCUT } from "../shared/shortcuts.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import { registerPromptWorkflowCommands } from "./prompt-workflows.ts";
@@ -109,9 +111,9 @@ const extractExecutionFlags = (rawArgs: string): { args: string; bg: boolean; fo
 	return { args, bg, fork };
 };
 
-function discoverSlashAgents(pi: ExtensionAPI, cwd: string, scope: AgentScope): { agents: AgentConfig[]; agentDiagnostics?: AgentDiscoveryDiagnostic[] } {
+function discoverSlashAgents(pi: ExtensionAPI, cwd: string, scope: AgentScope): { agents: AgentConfig[]; agentDiagnostics?: AgentDiscoveryDiagnostic[]; unknownAgentDiagnosticContext: UnknownAgentDiagnosticContext } {
 	const discovered = discoverAgents(cwd, scope);
-	if (listRuntimeAgentConfigs(pi).length === 0) return discovered;
+	if (listRuntimeAgentConfigs(pi).length === 0) return { ...discovered, unknownAgentDiagnosticContext: unknownAgentDiagnosticContext(discovered) };
 	const all = discoverAgentsAll(cwd);
 	const configuredAgents: AgentConfig[] = [
 		...all.builtin,
@@ -119,7 +121,8 @@ function discoverSlashAgents(pi: ExtensionAPI, cwd: string, scope: AgentScope): 
 		...(scope !== "project" ? all.user : []),
 		...(scope !== "user" ? all.project : []),
 	];
-	return mergeRuntimeAgents(pi, discovered, configuredAgents);
+	const merged = mergeRuntimeAgents(pi, discovered, configuredAgents);
+	return { ...merged, unknownAgentDiagnosticContext: { ...unknownAgentDiagnosticContext(discovered), agents: merged.agents } };
 }
 
 const makeAgentCompletions = (pi: ExtensionAPI, state: SubagentState) => (prefix: string) => {
@@ -694,7 +697,7 @@ export function registerSlashCommands(
 				: resolvedAgent.agent;
 			const diagnostic = findBlockingAgentDiagnostic(agentName, candidates, discovered.agentDiagnostics);
 			if (diagnostic || resolvedAgent.error || !resolvedAgent.agent) {
-				ctx.ui.notify(diagnostic ? `Agent '${agentName}' has invalid configuration: ${diagnostic.error}` : resolvedAgent.error ?? `Unknown agent: ${agentName}`, "error");
+				ctx.ui.notify(diagnostic ? `Agent '${agentName}' has invalid configuration: ${diagnostic.error}` : resolvedAgent.error ?? formatUnknownAgentError(agentName, discovered.unknownAgentDiagnosticContext), "error");
 				return;
 			}
 
@@ -819,11 +822,15 @@ export function registerSlashCommands(
 	}
 
 	pi.registerCommand("subagents-stop", {
-		description: "Stop a current-session async subagent run",
+		description: "Stop a current-session async subagent run, or one child of it with /subagents-stop <run-id> <child-id>",
 		handler: async (args, ctx) => {
-			const id = args.trim();
+			const [id, childId, ...extra] = args.trim().split(/\s+/).filter(Boolean);
+			if (extra.length > 0) {
+				sendSlashText(pi, "Usage: /subagents-stop [run-id] [child-id]");
+				return;
+			}
 			if (id) {
-				await runSlashSubagent(pi, ctx, { action: "stop", id });
+				await runSlashSubagent(pi, ctx, childId ? { action: "stop", id, childId } : { action: "stop", id });
 				return;
 			}
 
@@ -859,6 +866,70 @@ export function registerSlashCommands(
 				return;
 			}
 			await runSlashSubagent(pi, ctx, { action: "stop", id: result.target.id });
+		},
+	});
+
+	pi.registerCommand("subagents-steer", {
+		description: "Steer a live async subagent run with a message, or one child of it with --child <child-id>",
+		handler: async (args, ctx) => {
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const usage = "Usage: /subagents-steer <run-id> [--child <child-id>] <message>";
+			const [id, ...rest] = tokens;
+			if (!id || id.startsWith("--")) {
+				sendSlashText(pi, usage);
+				return;
+			}
+			// Only the optional child selector is parsed as a flag. Everything
+			// after the run id (or selector) is free-form message text, including
+			// a leading token such as `--verbose`.
+			let childId: string | undefined;
+			let messageStart = 0;
+			if (rest[0] === "--child" && rest[1] && !rest[1].startsWith("--")) {
+				childId = rest[1];
+				messageStart = 2;
+			}
+			const message = rest.slice(messageStart).join(" ").trim();
+			if (!message) {
+				sendSlashText(pi, usage);
+				return;
+			}
+			let targetId = id;
+			let childIndex: number | undefined;
+			if (childId !== undefined) {
+				const sessionId = state.currentSessionId ?? ctx.sessionManager.getSessionId() ?? undefined;
+				const run = listAsyncRuns(DIRS.async, {
+					runId: id,
+					states: ["queued", "running", "paused"],
+					...(sessionId ? { sessionId } : {}),
+				})[0];
+				const status = run ? readStatus(run.asyncDir) : null;
+				if (!run || !status) {
+					sendSlashText(pi, `No current-session async run found for '${id}'.`);
+					return;
+				}
+				const resolutionStatus = {
+					...status,
+					steps: status.steps?.map((step, index) => ({ ...step, children: run.steps[index]?.children ?? step.children })),
+				};
+				const resolution = resolveAsyncStatusChild(resolutionStatus, childId, { includeNested: true });
+				if (!resolution.ok) {
+					sendSlashText(pi, resolution.message);
+					return;
+				}
+				if (resolution.child.nested) targetId = resolution.child.nested.id;
+				else if (resolution.child.step.runId) targetId = resolution.child.step.runId;
+				else childIndex = resolution.child.index;
+			}
+			await runSlashSubagent(pi, ctx, {
+				action: "steer",
+				id: targetId,
+				message,
+				...(childIndex !== undefined ? { index: childIndex } : {}),
+				// Host-style exact-child authority, matching the extension RPC
+				// nonRecoveringSteer guarantee: never swap the addressed child for
+				// a pause-and-revive replacement after a missed acknowledgment.
+				steeringRecovery: false,
+			});
 		},
 	});
 

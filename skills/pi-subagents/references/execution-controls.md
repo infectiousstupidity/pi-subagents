@@ -24,7 +24,7 @@ Project settings resolve from the nearest parent directory containing `.pi` or `
 
 An agent may set `runner.type: external-cli` with a non-empty `command`, optional string `args`, and `promptDelivery: stdin` (the default). The command runs with `shell: false`, inherits the resolved cwd and environment, and receives the combined agent instructions and task through stdin. It must already be installed; pi-subagents adds no CLI dependency.
 
-External CLI profiles are async-only and one-shot. They support lifecycle artifacts, stdout/stderr logs, timeout, and stop. Full stdout and stderr are retained in their log files, while the final stdout response and stderr error kept in memory are each limited to their last 64 KiB. They do not support foreground/clarify, steer/resume/interrupt-as-pause, Pi models/tools/extensions/skills, tool or turn budgets, structured output, nested subagents, fallbacks, or sessions.
+External CLI profiles are async-only and one-shot. They support lifecycle artifacts, stdout/stderr logs, timeout, and stop. Full stdout and stderr are retained in their log files, while the final stdout response and stderr error kept in memory are each limited to their last 64 KiB. They do not support native Pi child options such as model override, structured output, acceptance/agent contract, tool budgets, fast mode, fork context, skills, or native Pi tools unless the runner explicitly implements them. Foreground/clarify, steer/resume/interrupt-as-pause, nested subagents, fallbacks, and sessions are also unsupported.
 
 ### External job profiles
 
@@ -32,7 +32,7 @@ An agent may set `runner.type: external-job` with a non-empty `provider` and opt
 
 External job profiles are async-only. The provider owns the remote job and Pi owns the async run record. Status persists provider name, provider job id, prompt digest, provider options, handle/conversation URLs when supplied, result artifact path, last known state, and provider failure code/message. Recovery uses existing provider job metadata to call `reattach` and `result`; it refuses to redispatch a prompt when the persisted provider job does not match the prompt digest.
 
-External job profiles do not support foreground/clarify, steer/resume, Pi models/tools/extensions/skills, tool or turn budgets, structured output, native child permissions, fallbacks, or Pi child sessions. Capacity conflicts fail closed and include the blocking provider job id when the provider supplies it.
+External job profiles do not support foreground/clarify, steer/resume, Pi models/tools/extensions/skills, tool budgets, structured output, native child permissions, fallbacks, or Pi child sessions. Capacity conflicts fail closed and include the blocking provider job id when the provider supplies it.
 
 ### Single agent
 
@@ -93,7 +93,7 @@ return runs.run("cross-oracle", {
 });
 ```
 
-Keyed resume reads that one exact receipt and revalidates the retained run at launch. It fails when the workflow or key is missing, the receipt is stale, `latest` is not `true`, or the recorded child is no longer resumable. Foreground workflow results expose the same receipt in `details.workflow.receipt`, but cross-workflow keyed lookup requires the durable receipt from an async workflow.
+Keyed resume reads that one exact receipt and revalidates the retained run at launch. It fails when the workflow or key is missing, the receipt is stale, `latest` is not `true`, or the recorded child is no longer resumable. The receipt is terminal-only: if `status.json` or `events.jsonl` exists without it, the workflow may still be active or terminal receipt writing may have failed. Use direct child run IDs from status/events for direct resume after the normal retained-child checks; do not reconstruct keyed entries from those files. Foreground workflow results expose the same receipt in `details.workflow.receipt`, but cross-workflow keyed lookup requires the durable receipt from an async workflow.
 
 ### Async/background
 

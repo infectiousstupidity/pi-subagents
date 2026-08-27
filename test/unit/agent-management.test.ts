@@ -548,7 +548,6 @@ Advise only.
 					scope: "project",
 					async: false,
 					timeoutMs: 120_000,
-					turnBudget: { maxTurns: 8, graceTurns: 2 },
 					acceptance: { level: "none", reason: "lightweight reviewer" },
 					outputMode: "file-only",
 				},
@@ -561,7 +560,6 @@ Advise only.
 		let content = fs.readFileSync(filePath, "utf-8");
 		assert.match(content, /^async: false$/m);
 		assert.match(content, /^timeoutMs: 120000$/m);
-		assert.match(content, /^turnBudget: \{"maxTurns":8,"graceTurns":2\}$/m);
 		assert.match(content, /^acceptance: \{"level":"none","reason":"lightweight reviewer"\}$/m);
 		assert.match(content, /^outputMode: file-only$/m);
 
@@ -569,19 +567,17 @@ Advise only.
 		assert.equal(got.isError, false);
 		assert.match(readText(got), /Async: false/);
 		assert.match(readText(got), /Timeout: 120000ms/);
-		assert.match(readText(got), /Turn budget: \{"maxTurns":8,"graceTurns":2\}/);
 		assert.match(readText(got), /Acceptance: \{"level":"none","reason":"lightweight reviewer"\}/);
 		assert.match(readText(got), /Output mode: file-only/);
 
 		const updated = handleUpdate(
-			{ agent: "background-reviewer", config: { async: true, timeoutMs: false, turnBudget: false, acceptance: "", outputMode: "inline" } },
+			{ agent: "background-reviewer", config: { async: true, timeoutMs: false, acceptance: "", outputMode: "inline" } },
 			ctx,
 		);
 		assert.equal(updated.isError, false);
 		content = fs.readFileSync(filePath, "utf-8");
 		assert.match(content, /^async: true$/m);
 		assert.doesNotMatch(content, /^timeoutMs:/m);
-		assert.doesNotMatch(content, /^turnBudget:/m);
 		assert.doesNotMatch(content, /^acceptance:/m);
 		assert.match(content, /^outputMode: inline$/m);
 
@@ -1007,9 +1003,24 @@ Drive the failing test first.
 		assert.match(text, /^Builtin subagent models/m);
 		assert.match(text, /Current session model:\n  openai\/gpt-5-mini/);
 		assert.match(text, /(?:^|\n)scout\n  model:\n    openai\/gpt-5-mini\n  source: inherits current session model(?:\n|$)/);
+		assert.match(text, /(?:^|\n)advisor\n  model:\n    openai\/gpt-5-mini\n  source: inherits current session model(?:\n|$)/);
+		assert.doesNotMatch(text, /advisor\n  model:\n    \(builtin definition not found\)/);
 		assert.match(text, /Available models in this session's registry/);
 		assert.match(text, /  anthropic\/claude-sonnet-4\n  openai\/gpt-5-mini/);
 		assert.match(text, /Use an exact provider\/id from this list when you pass model/);
+	});
+
+	it("resolves the advisor builtin alias in a filtered model mapping", () => {
+		const result = handleManagementAction("models", { agent: "advisor" }, {
+			cwd: tempDir,
+			modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] },
+			model: { provider: "openai", id: "gpt-5-mini" },
+		});
+		const text = readText(result);
+		assert.equal(result.isError, false);
+		assert.match(text, /Agent: advisor/);
+		assert.match(text, /Effective model:\n  openai\/gpt-5-mini/);
+		assert.doesNotMatch(text, /Builtin agent 'advisor' not found|source: missing/);
 	});
 
 	it("reports override source and disabled builtin state in runtime model mappings", () => {

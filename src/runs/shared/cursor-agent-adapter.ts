@@ -1,9 +1,10 @@
 import * as path from "node:path";
-import type { ExternalCliParser, ExternalCliParserProgress, ExternalCliParserTerminal } from "./external-cli-runner.ts";
+import { parseExternalCliJsonlEvent, type ExternalCliParser, type ExternalCliParserProgress, type ExternalCliParserTerminal } from "./external-cli-runner.ts";
 import type { ExternalCliPreflightSpec } from "./external-cli-preflight.ts";
 
 const MAX_EVENT_TYPE_LENGTH = 128;
 const MAX_ERROR_LENGTH = 4_096;
+const MAX_OVERSIZED_TOOL_CALL_BYTES = 1024 * 1024;
 
 export const CURSOR_AGENT_ADAPTER_ID = "cursor-agent" as const;
 export const CURSOR_AGENT_WRITER_ADAPTER_ID = "cursor-agent-writer" as const;
@@ -35,12 +36,7 @@ export function createCursorAgentJsonlParser(): ExternalCliParser {
 	let terminal: ExternalCliParserTerminal | undefined;
 	return {
 		parseLine(line): ExternalCliParserProgress {
-			let value: unknown;
-			try { value = JSON.parse(line) as unknown; }
-			catch (error) { throw new Error(`Cursor Agent emitted malformed JSONL: ${error instanceof Error ? error.message : String(error)}`); }
-			if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Cursor Agent emitted a JSONL event that is not an object.");
-			const event = value as Record<string, unknown>;
-			if (typeof event.type !== "string" || !event.type || event.type.length > MAX_EVENT_TYPE_LENGTH) throw new Error("Cursor Agent emitted a JSONL event with an invalid type.");
+			const event = parseExternalCliJsonlEvent(line, "Cursor Agent", MAX_EVENT_TYPE_LENGTH);
 			if (terminal) throw new Error("Cursor Agent emitted an event after its terminal state.");
 			eventCount += 1;
 			if (event.type === "error") terminal = { state: "failed", error: terminalError(event) };
@@ -50,6 +46,11 @@ export function createCursorAgentJsonlParser(): ExternalCliParser {
 				} else terminal = { state: "failed", error: terminalError(event) };
 			}
 			return { phase: terminal ? terminal.state : "streaming", eventCount };
+		},
+		skipOversizedLine(prefix, byteLength): ExternalCliParserProgress | undefined {
+			if (terminal || byteLength > MAX_OVERSIZED_TOOL_CALL_BYTES || !/^\s*\{\s*"type"\s*:\s*"tool_call"\s*,/.test(prefix)) return undefined;
+			eventCount += 1;
+			return { phase: "streaming", eventCount };
 		},
 		finish(): ExternalCliParserTerminal | undefined {
 			return terminal;

@@ -28,22 +28,30 @@ export interface RunnerSubagentStep {
 	outputName?: string;
 	structured?: boolean;
 	cwd?: string;
+	/** Original cwd input retained for launch diagnostics. */
+	requestedCwd?: string;
 	model?: string;
+	contextLimit?: number;
 	fast?: boolean;
 	thinking?: string;
 	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
 	modelCandidates?: string[];
 	/** The primary model is inherited from the parent session and should not be verified against the child-reported active registry model. */
 	skipPrimaryModelVerification?: boolean;
-	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string }>;
+	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
 	tools?: string[];
+	allowNestedSubagents?: boolean;
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
+	mcpConfig?: import("./mcp-direct-tool-allowlist.ts").McpConfig;
+	runtimeServerNames?: string[];
+	mutationTools?: string[];
 	completionGuard?: boolean;
 	systemPrompt?: string | null;
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext: boolean;
+	inheritGlobalContext: boolean;
 	inheritSkills: boolean;
 	skills?: string[];
 	outputPath?: string;
@@ -56,6 +64,7 @@ export interface RunnerSubagentStep {
 	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
 	toolTimeoutMs?: number;
 	waitToolEnabled?: boolean;
+	waitToolDefaultTimeoutMs?: number;
 	structuredOutput?: {
 		schema: import("../../shared/types.ts").JsonSchemaObject;
 		schemaPath: string;

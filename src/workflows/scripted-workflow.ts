@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
+import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/parallel-utils.ts";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const requireFromPackage = createRequire(import.meta.url);
@@ -654,6 +655,7 @@ parentPort.on("message", async (message) => {
 export interface WorkflowScriptChildResult {
 	key: string;
 	ok: boolean;
+	terminalOutcome?: import("../shared/types.ts").WorkflowTerminalOutcome;
 	stopped?: boolean;
 	/** Canonical child agent name when launch resolution produced one. */
 	agent?: string;
@@ -666,6 +668,7 @@ export interface WorkflowScriptChildResult {
 	requestedContext?: "fresh" | "fork";
 	resolvedContext?: "fresh" | "fork" | "mixed";
 	outputReference?: string;
+	outputPathMapping?: { requestedPath: string; savedPath: string };
 	externalAdapter?: import("../shared/types.ts").ExternalCliReceiptMetadata;
 	resumability?: { state: "resumable" } | { state: "not-resumable"; reason: string };
 	continuation?: { runIds: string[] };
@@ -722,9 +725,9 @@ export interface WorkflowScriptResult {
 
 export class WorkflowScriptError extends Error {
 	readonly partial: Omit<WorkflowScriptResult, "value">;
-	readonly errorKind?: "detached-child";
+	readonly errorKind?: "detached-child" | "timeout";
 
-	constructor(message: string, partial: Omit<WorkflowScriptResult, "value">, errorKind?: "detached-child") {
+	constructor(message: string, partial: Omit<WorkflowScriptResult, "value">, errorKind?: "detached-child" | "timeout") {
 		super(message);
 		this.name = "WorkflowScriptError";
 		this.partial = partial;
@@ -734,10 +737,14 @@ export class WorkflowScriptError extends Error {
 
 export interface RunWorkflowScriptOptions {
 	script: string;
+	/** Host-only first-slice admission context. It is never sent to the workflow worker. */
+	oneUsePermit?: { claim: (key: string) => string | undefined };
 	timeoutMs?: number;
 	signal?: AbortSignal;
+	/** Maximum children executing concurrently within this workflow. Defaults to 20. */
+	globalConcurrencyLimit?: number;
 	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>) => void | Promise<void>;
-	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean }) => Promise<WorkflowScriptChildResult>;
+	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean }) => Promise<WorkflowScriptChildResult>;
 	resolveResume?: (reference: WorkflowReceiptResumeReference, signal: AbortSignal) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
 	steer?: (key: string, message: string, options: WorkflowSteerOptions, signal: AbortSignal) => Promise<WorkflowSteerResult>;
@@ -1107,9 +1114,48 @@ function resolveWorkflowParserEntry(): string {
 	}
 }
 
+const AUTO_RESUME_PARAM_KEYS = ["acceptance", "agentContract", "index", "intercomBridge", "label", "maxRuntimeMs", "output", "outputMode", "outputSchema", "phase", "skill", "skills", "task", "timeoutMs", "toolBudget", "worktree"] as const;
+
+function isZeroUsage(usage: unknown): boolean {
+	if (!isRecord(usage)) return false;
+	const cost = usage.cost;
+	return (usage.input ?? 0) === 0
+		&& (usage.output ?? 0) === 0
+		&& (usage.cacheRead ?? 0) === 0
+		&& (usage.cacheWrite ?? 0) === 0
+		&& (!isRecord(cost) || (cost.total ?? 0) === 0);
+}
+
+function setupAbortResumeParams(params: Record<string, unknown>, result: WorkflowScriptChildResult, signal: AbortSignal): Record<string, unknown> | undefined {
+	if (signal.aborted || result.ok || result.stopped || result.interrupted || !result.runId) return undefined;
+	const childResult = Array.isArray(result.results) && result.results.length === 1 && isRecord(result.results[0]) ? result.results[0] : undefined;
+	const error = typeof childResult?.error === "string" ? childResult.error : result.error;
+	if (error !== "This operation was aborted" || !isZeroUsage(childResult?.usage)) return undefined;
+	const messages = Array.isArray(childResult?.messages) ? childResult.messages : [];
+	const message = messages.findLast((entry) => isRecord(entry) && entry.role === "assistant");
+	if (message !== undefined) {
+		if (!isRecord(message)) return undefined;
+		if (message.stopReason !== "error" || message.errorMessage !== error) return undefined;
+		if (!Array.isArray(message.content) || message.content.length > 0 || !isZeroUsage(message.usage)) return undefined;
+		if (Object.hasOwn(message, "diagnostics") || Object.hasOwn(message, "responseId")) return undefined;
+	}
+	const task = typeof params.task === "string" && params.task.trim() ? params.task.trim() : "Continue after the setup abort.";
+	const resumeParams: Record<string, unknown> = { resume: result.runId, task };
+	for (const key of AUTO_RESUME_PARAM_KEYS) {
+		if (Object.hasOwn(params, key)) resumeParams[key] = params[key];
+	}
+	resumeParams.resume = result.runId;
+	resumeParams.task = task;
+	return resumeParams;
+}
+
 export async function runWorkflowScript(options: RunWorkflowScriptOptions): Promise<WorkflowScriptResult> {
 	if (!options.script.trim()) throw new Error("workflowScript must not be empty.");
 	if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1)) throw new Error("workflow script timeout must be a positive integer.");
+	if (options.globalConcurrencyLimit !== undefined && (!Number.isInteger(options.globalConcurrencyLimit) || options.globalConcurrencyLimit < 1)) {
+		throw new Error("workflow script global concurrency limit must be a positive integer.");
+	}
+	const launchSemaphore = new Semaphore(options.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT);
 
 	let acornPath: string;
 	try {
@@ -1192,7 +1238,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 							return unobservedSteers.length > 0 ? new Error(`workflowScript completed with unawaited runs.steer call(s): ${unobservedSteers.map((key) => `'${key}'`).join(", ")}. Await or return each call.`) : undefined;
 						})()
 						: undefined;
-				if ("error" in outcome) reject(new WorkflowScriptError(outcome.error.message, partial(), outcome.error.workflowErrorKind === "detached-child" ? "detached-child" : undefined));
+				if ("error" in outcome) reject(new WorkflowScriptError(outcome.error.message, partial(), outcome.error.workflowErrorKind === "detached-child" || outcome.error.workflowErrorKind === "timeout" ? outcome.error.workflowErrorKind : undefined));
 				else if (completionError) reject(new WorkflowScriptError(completionError.message, partial()));
 				else resolve({ value: outcome.value, ...partial() });
 			});
@@ -1223,7 +1269,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		};
 		const timer = options.timeoutMs === undefined
 			? undefined
-			: setTimeout(() => finish({ error: new Error(`Workflow script timed out after ${options.timeoutMs}ms.`) }), options.timeoutMs);
+			: setTimeout(() => {
+				const error = new Error(`Workflow script timed out after ${options.timeoutMs}ms.`) as Error & { workflowErrorKind: "timeout" };
+				error.workflowErrorKind = "timeout";
+				finish({ error });
+			}, options.timeoutMs);
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		if (options.signal?.aborted) return onAbort();
 
@@ -1381,6 +1431,31 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			}
 			const params = message.args.params;
 			if (!isRecord(params)) return respond(Promise.reject(new Error(`runs.run('${key}', params) requires a params object.`)));
+			const collectFailure = message.args.collectFailure === true;
+			const callObserved = observedRunCalls.delete(message.callId);
+			const deliver = (promise: Promise<WorkflowScriptChildResult>) => collectFailure
+				? promise
+				: promise.then((result) => {
+					if (!result.ok && !result.stopped) {
+						const childError = new Error(result.detached ? `Run '${key}' detached: ${result.error ?? result.output}` : `Run '${key}' failed: ${result.error ?? result.output}`) as Error & { workflowErrorKind?: "detached-child" };
+						if (result.detached) childError.workflowErrorKind = "detached-child";
+						throw childError;
+					}
+					return result;
+				});
+			const fingerprint = stableJson(params);
+			const existing = launches.get(key);
+			if (existing) {
+				if (existing.fingerprint !== fingerprint) return respond(Promise.reject(new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`)));
+				if (callObserved) existing.observed = true;
+				trace.push({ operation: "run", key, state: "reused", ...workflowStringMetadata(params) });
+				traceChanged();
+				return respond(deliver(existing.promise), `runs.run('${key}') result`);
+			}
+			const permitError = options.oneUsePermit?.claim(key);
+			if (permitError) return respond(Promise.reject(new Error(permitError)));
+			if (options.oneUsePermit && message.args.batch !== undefined) return respond(Promise.reject(new Error("Workflow child permit does not support runs.all.")));
+			if (options.oneUsePermit && params.resume !== undefined) return respond(Promise.reject(new Error("Workflow child permit does not support retained resume.")));
 			if (params.action !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') accepts execution params only; management action is not allowed.`)));
 			if (params.workflowScript !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') cannot start a nested workflow script.`)));
 			if (params.tasks !== undefined || params.chain !== undefined || params.parallel !== undefined || params.concurrency !== undefined || params.chainDir !== undefined) {
@@ -1411,28 +1486,6 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (params.resume !== undefined && (typeof params.task !== "string" || !params.task.trim())) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') resume requires a non-empty task follow-up.`)));
 			}
-			const collectFailure = message.args.collectFailure === true;
-			const callObserved = observedRunCalls.delete(message.callId);
-			const deliver = (promise: Promise<WorkflowScriptChildResult>) => collectFailure
-				? promise
-				: promise.then((result) => {
-					if (!result.ok && !result.stopped) {
-						const childError = new Error(result.detached ? `Run '${key}' detached: ${result.error ?? result.output}` : `Run '${key}' failed: ${result.error ?? result.output}`) as Error & { workflowErrorKind?: "detached-child" };
-						if (result.detached) childError.workflowErrorKind = "detached-child";
-						throw childError;
-					}
-					return result;
-				});
-			const fingerprint = stableJson(params);
-			const existing = launches.get(key);
-			if (existing) {
-				if (existing.fingerprint !== fingerprint) return respond(Promise.reject(new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`)));
-				if (callObserved) existing.observed = true;
-				trace.push({ operation: "run", key, state: "reused", ...workflowStringMetadata(params) });
-				traceChanged();
-				return respond(deliver(existing.promise), `runs.run('${key}') result`);
-			}
-
 			const startedAt = Date.now();
 			const batch = isRecord(message.args.batch) && typeof message.args.batch.id === "string" && Array.isArray(message.args.batch.calls)
 				? { id: message.args.batch.id, calls: message.args.batch.calls.filter((call): call is { key: string; params: Record<string, unknown> } => isRecord(call) && typeof call.key === "string" && isRecord(call.params)) }
@@ -1482,7 +1535,23 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					if (resolvedResumeLineage.at(-1) !== resolvedResumeId) resolvedResumeLineage.push(resolvedResumeId!);
 				}
 				const launchParams = resolvedResumeId ? { ...params, resume: resolvedResumeId } : params;
-				return options.launch(key, launchParams, childSignal, { admitted: true });
+				await launchSemaphore.acquire();
+				try {
+					if (settled || finishing || stoppedLaunches.has(key) || childSignal.aborted) {
+						const reason = childSignal.reason;
+						const text = children.get(key)?.error ?? (reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
+						return stoppedChildResult(key, text);
+					}
+					const result = await options.launch(key, launchParams, childSignal, { admitted: true, batch: batch !== undefined });
+					const autoResumeParams = setupAbortResumeParams(params, result, childSignal);
+					if (!autoResumeParams) return result;
+					resolvedResumeLineage = [...new Set([...(resolvedResumeLineage ?? []), result.runId!])];
+					trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(autoResumeParams), phase: "auto-resume", runId: result.runId });
+					traceChanged();
+					return options.launch(key, autoResumeParams, childSignal, { admitted: true, batch: batch !== undefined });
+				} finally {
+					launchSemaphore.release();
+				}
 			}).then((result) => {
 				let normalized = !result.ok && !result.error ? { ...result, error: result.output } : result;
 				if (resolvedResumeLineage?.length && normalized.runId) {

@@ -6,13 +6,14 @@ import {
 	formatSubagentModelVerificationError,
 	isContextOverflow,
 	isRetryableModelFailure,
+	isRetryableModelFailureAttempt,
 	normalizeModelSegment,
 	recordRetryableModelFailure,
 	resolveEffectiveSubagentModel,
 	resolveModelCandidate,
 	resolveSubagentModelOverride,
 } from "../../src/runs/shared/model-fallback.ts";
-import { clearExclusions } from "../../src/runs/shared/model-exclusions.ts";
+import { clearExclusions, recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
 import { resolveModelScopesForAgent } from "../../src/runs/shared/model-scope.ts";
 
 beforeEach(() => clearExclusions());
@@ -50,6 +51,38 @@ describe("model fallback helpers", () => {
 				[{ provider: "ollama-cloud", id: "deepseek-v4-flash:0731", fullId: "ollama-cloud/deepseek-v4-flash:0731" }],
 			),
 			undefined,
+		);
+	});
+
+	it("accepts a bare leaf reported by an Anthropic gateway driver", () => {
+		const gatewayModels = [{
+			provider: "bifrost-anthropic",
+			id: "vertex/claude-fable-5",
+			fullId: "bifrost-anthropic/vertex/claude-fable-5",
+		}];
+		assert.equal(
+			formatSubagentModelVerificationError(
+				"bifrost-anthropic/vertex/claude-fable-5:high",
+				"claude-fable-5",
+				gatewayModels,
+			),
+			undefined,
+		);
+		assert.match(
+			formatSubagentModelVerificationError(
+				"bifrost-anthropic/vertex/claude-fable-5:high",
+				"wrong-provider/claude-fable-5",
+				gatewayModels,
+			) ?? "",
+			/model_verification_failed/,
+		);
+		assert.match(
+			formatSubagentModelVerificationError(
+				"bifrost-anthropic/vertex/claude-fable-5:high",
+				"claude-sonnet-4",
+				gatewayModels,
+			) ?? "",
+			/model_verification_failed/,
 		);
 	});
 
@@ -199,6 +232,9 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("Subagent produced no output (possible model cold-start or empty response)."), true);
 		assert.equal(isRetryableModelFailure("model load failed"), true);
 		assert.equal(isRetryableModelFailure("Stream ended without finish_reason"), true);
+		assert.equal(isRetryableModelFailure("Connection error"), true);
+		assert.equal(isRetryableModelFailure("APIConnectionError: Connection closed."), true);
+		assert.equal(isRetryableModelFailure("Connection reset by peer"), true);
 		assert.equal(isRetryableModelFailure("Request timed out."), true);
 	});
 
@@ -216,6 +252,13 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("mcp:tools.search failed with exit code 1"), false);
 		assert.equal(isRetryableModelFailure("Provider error: bash failed (exit 1): request timed out"), true);
 		assert.equal(isRetryableModelFailure("bash failed (exit unknown): request timed out"), true);
+	});
+
+	it("does not retry raw process stderr after child activity", () => {
+		assert.equal(isRetryableModelFailureAttempt({ error: "APIConnectionError: Connection closed.", messages: [{ role: "assistant" }], toolCount: 0 }), false);
+		assert.equal(isRetryableModelFailureAttempt({ error: "APIConnectionError: Connection closed.", messages: [{ role: "assistant", errorMessage: "APIConnectionError: Connection closed." }], toolCount: 0 }), true);
+		assert.equal(isRetryableModelFailureAttempt({ error: "APIConnectionError: Connection closed.", messages: [], toolCount: 0 }), true);
+		assert.equal(isRetryableModelFailureAttempt({ error: "APIConnectionError: Connection closed.", messages: [{ role: "assistant", errorMessage: "APIConnectionError: Connection closed." }], toolCount: 1 }), false);
 	});
 });
 
@@ -270,6 +313,17 @@ describe("resolveSubagentModelOverride (cross-session inherit, issue #266)", () 
 		assert.equal(
 			resolveSubagentModelOverride("gpt-5-mini", parentModel, availableModels),
 			"openai/gpt-5-mini",
+		);
+	});
+
+	it("fails visibly when an explicit model is excluded instead of falling back", () => {
+		recordModelFailure({ modelId: "gpt-5-mini", provider: "openai", reason: "rate limit" });
+		assert.throws(
+			() => resolveEffectiveSubagentModel("openai/gpt-5-mini", undefined, parentModel, availableModels),
+			(error: unknown) => {
+				const message = String(error);
+				return message.includes("openai/gpt-5-mini") && message.includes("rate limit") && message.includes("expires:");
+			},
 		);
 	});
 

@@ -9,81 +9,43 @@ import {
 	type IntercomEventBus,
 	type SingleResult,
 	type SubagentState,
+	type WorkflowTerminalResolution,
 } from "../../shared/types.ts";
 import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { resultFilePath, writeAsyncResultFile } from "../background/result-files.ts";
 import { resolveAsyncResumeTarget } from "../background/async-resume.ts";
 import { externalCliReceiptMetadata, normalizeExternalCliRunnerStatus } from "../shared/external-cli-contract.ts";
+import { outputPathMappingFromTask } from "../shared/single-output.ts";
 import { readWorkflowReceipt, workflowReceiptPath, writeWorkflowReceipt, type WorkflowReceipt } from "../../workflows/workflow-receipt.ts";
-import { workflowChildSummary } from "../../workflows/workflow-child-summary.ts";
-
-function cloneWorkflowStatus(status: AsyncStatus): AsyncStatus {
-	return {
-		...status,
-		steps: status.steps?.map((step) => ({ ...step })),
-		workflow: status.workflow ? { ...status.workflow, trace: [...(status.workflow.trace ?? [])] } : status.workflow,
-	};
-}
-
-function childSucceeded(result: Pick<SingleResult, "exitCode" | "error" | "interrupted">): boolean {
-	return result.exitCode === 0 && !result.error && !result.interrupted;
-}
-
-const UNSUPPORTED_DETACHED_WORKFLOW_CONTINUATION = "unsupported-continuation: detached workflow child settled, but JavaScript workflow continuation was not persisted. Resume the workflow explicitly instead of treating the completed child as top-level workflow completion.";
-const INTERRUPTED_DETACHED_CHILD = "Interrupted. Waiting for explicit next action.";
+import {
+	applyDetachedChildSettlement,
+	classifyWorkflowSettlement,
+	findWorkflowSettlementStep,
+	planWorkflowSettlement,
+	promoteSettledPausedWorkflow,
+	workflowOutputPathMappingSummary,
+	workflowRecoveryActions,
+	workflowTerminalOutcomeForResult,
+	type WorkflowPublicChild,
+	type WorkflowStatusStep,
+} from "../../workflows/workflow-settlement.ts";
 
 export function applyDetachedChildToPausedWorkflow(
 	status: AsyncStatus,
-	input: { childRunId: string; result: Pick<SingleResult, "exitCode" | "error" | "interrupted" | "sessionFile">; workflowKey?: string },
+	input: { childRunId: string; result: Pick<SingleResult, "exitCode" | "error" | "interrupted" | "sessionFile" | "stopped">; workflowKey?: string },
 ): AsyncStatus | undefined {
-	if (status.mode !== "workflow" || status.state !== "paused") return undefined;
-	const next = cloneWorkflowStatus(status);
-	const step = next.steps?.find((candidate) => candidate.runId === input.childRunId)
-		?? (input.workflowKey ? next.steps?.find((candidate) => candidate.workflowKey === input.workflowKey) : undefined);
-	if (!step) return undefined;
-	const succeeded = childSucceeded(input.result);
-	const failedSiblingError = next.steps?.find((candidate) => candidate !== step && candidate.status === "failed" && candidate.error)?.error;
-	const updatedAt = Date.now();
-	step.status = succeeded ? "completed" : "failed";
-	step.endedAt = updatedAt;
-	delete step.activityState;
-	delete step.currentTool;
-	delete step.currentToolStartedAt;
-	if (input.result.sessionFile) step.sessionFile = input.result.sessionFile;
-	if (succeeded) delete step.error;
-	else if (input.result.interrupted) step.error = input.result.error ?? INTERRUPTED_DETACHED_CHILD;
-	else if (input.result.error) step.error = input.result.error;
-	next.lastUpdate = updatedAt;
-	const promoted = promotePausedWorkflowIfSettled(next);
-	if (promoted?.state === "failed" && input.result.interrupted && !failedSiblingError) promoted.error = input.result.error ?? INTERRUPTED_DETACHED_CHILD;
-	else if (promoted?.state === "failed" && input.result.error) promoted.error = input.result.error;
-	const resolved = promoted ?? next;
-	const workflowState = resolved.state === "complete" ? "completed" : resolved.state === "paused" ? "paused" : resolved.state === "stopped" ? "stopped" : "failed";
-	resolved.workflowChildren = workflowChildSummary({ parentToolCallId: resolved.toolCallId ?? resolved.runId, workflowRunId: resolved.runId, workflowState, inventoryComplete: true, trace: resolved.workflow?.trace, steps: resolved.steps });
-	return resolved;
+	return applyDetachedChildSettlement(status, input);
 }
 
 export function promotePausedWorkflowIfSettled(status: AsyncStatus): AsyncStatus | undefined {
-	if (status.mode !== "workflow" || status.state !== "paused") return undefined;
-	const next = cloneWorkflowStatus(status);
-	const stillOpen = next.steps?.some((candidate) =>
-		candidate.status === "running"
-		|| (candidate.status === "paused" && candidate.activityState === "needs_attention")
-	) === true;
-	if (stillOpen || !next.steps?.length) return undefined;
-	const failed = next.steps.some((candidate) => candidate.status === "failed");
-	const updatedAt = Date.now();
-	next.lastUpdate = updatedAt;
-	next.state = "failed";
-	next.endedAt = updatedAt;
-	delete next.activityState;
-	if (failed) return next;
-	next.error = UNSUPPORTED_DETACHED_WORKFLOW_CONTINUATION;
-	return next;
+	return promoteSettledPausedWorkflow(status);
 }
 
-function workflowResultChildren(status: AsyncStatus, childRunId: string, result: SingleResult, existingResults: unknown): unknown {
+function workflowResultChildren(status: AsyncStatus, childRunId: string, result: SingleResult, existingResults: unknown, receipt?: WorkflowReceipt): unknown {
 	const output = getSingleResultOutput(result);
+	const outputReference = result.savedOutputPath ?? result.outputReference?.path;
+	const outputPathMapping = outputPathMappingFromTask(result.task, outputReference);
+	const terminalOutcome = workflowTerminalOutcomeForResult(result);
 	if (Array.isArray(existingResults)) {
 		return existingResults.map((entry) => {
 			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
@@ -91,62 +53,40 @@ function workflowResultChildren(status: AsyncStatus, childRunId: string, result:
 			if (child.runId !== childRunId) return child;
 			return {
 				...child,
-				success: childSucceeded(result),
+				success: result.exitCode === 0 && !result.error && !result.interrupted,
 				output,
 				outputState: output.trim() ? "present" : "absent",
 				detached: undefined,
-				...(result.interrupted ? { interrupted: true } : {}),
+				...(outputReference ? { outputReference } : {}),
+				...(outputPathMapping ? { outputPathMapping } : {}),
+				...(result.interrupted || result.stopped ? { interrupted: true } : {}),
+				...(result.stopped ? { stopped: true } : {}),
+				...(terminalOutcome ? { terminalOutcome } : {}),
 				...(result.error ? { error: result.error } : {}),
 			};
 		});
 	}
-	return status.steps?.map((step) => ({
+	return status.steps?.map((step: WorkflowStatusStep) => ({
 		workflowKey: step.workflowKey,
 		agent: step.agent,
 		runId: step.runId,
 		success: step.status === "completed" || step.status === "complete",
 		output: step.runId === childRunId ? output : "",
 		outputState: step.runId === childRunId && output.trim() ? "present" : "absent",
-		...(step.runId === childRunId && result.interrupted ? { interrupted: true } : {}),
+		...(step.runId === childRunId && outputReference ? { outputReference } : step.workflowKey && receipt?.entries[step.workflowKey]?.outputReference ? { outputReference: receipt.entries[step.workflowKey]!.outputReference } : {}),
+		...(step.runId === childRunId && outputPathMapping ? { outputPathMapping } : step.outputPathMapping ? { outputPathMapping: step.outputPathMapping } : {}),
+		...(step.interrupted ? { interrupted: true } : {}),
+		...(step.runId === childRunId && terminalOutcome ? { terminalOutcome } : step.workflowKey && receipt?.entries[step.workflowKey]?.terminalOutcome ? { terminalOutcome: receipt.entries[step.workflowKey]!.terminalOutcome } : {}),
+		...(step.stopped ? { stopped: true } : {}),
 		...(step.error ? { error: step.error } : {}),
 	}));
 }
 
-function publishedWorkflowResult(status: AsyncStatus, childRunId: string, result: SingleResult, asyncDir: string, existing?: Record<string, unknown>, receipt?: WorkflowReceipt): Record<string, unknown> {
-	const sessionId = status.sessionId ?? (typeof existing?.sessionId === "string" ? existing.sessionId : undefined);
-	const summary = status.state === "complete"
-		? `Workflow completed after detached child ${childRunId} finished.`
-		: status.error ?? (typeof existing?.summary === "string" ? existing.summary : undefined);
-	return {
-		...(existing ?? {}),
-		id: status.runId,
-		runId: status.runId,
-		toolCallId: status.toolCallId,
-		agent: "workflow",
-		mode: "workflow",
-		success: status.state === "complete",
-		state: status.state,
-		summary,
-		error: status.error,
-		activityState: status.activityState,
-		endedAt: status.endedAt,
-		timestamp: Date.now(),
-		results: workflowResultChildren(status, childRunId, result, existing?.results),
-		workflow: status.workflow,
-		workflowChildren: status.workflowChildren,
-		reconciledFromDetachedChild: childRunId,
-		...(receipt ? { workflowReceipt: { path: path.join(asyncDir, "workflow-receipt.json"), receipt } } : {}),
-		asyncDir,
-		cwd: status.cwd,
-		sessionId,
-		completionOwnerId: status.completionOwnerId,
-	};
-}
-
-function reconcileWorkflowReceipt(status: AsyncStatus, childRunId: string, result: SingleResult, asyncDir: string): WorkflowReceipt | undefined {
-	const receiptPath = workflowReceiptPath(DIRS.async, status.runId);
+function reconcileWorkflowReceipt(status: AsyncStatus, childRunId: string, result: SingleResult, asyncDir: string, resolution: WorkflowTerminalResolution | undefined): WorkflowReceipt | undefined {
+	const receiptRoot = path.dirname(asyncDir);
+	const receiptPath = workflowReceiptPath(receiptRoot, status.runId);
 	if (!fs.existsSync(receiptPath)) return undefined;
-	const receipt = readWorkflowReceipt(DIRS.async, status.runId);
+	const receipt = readWorkflowReceipt(receiptRoot, status.runId);
 	const step = status.steps?.find((candidate) => candidate.runId === childRunId);
 	const key = step?.workflowKey;
 	if (!key) throw new Error(`Workflow receipt '${status.runId}' cannot identify detached child '${childRunId}' by stable key.`);
@@ -165,6 +105,7 @@ function reconcileWorkflowReceipt(status: AsyncStatus, childRunId: string, resul
 	const externalRunner = normalizeExternalCliRunnerStatus(result.runner?.type === "external-cli" ? result.runner : externalStep?.runner);
 	const externalProcess = result.externalProcess ?? externalStep?.externalProcess;
 	const externalAdapter = externalRunner ? externalCliReceiptMetadata({ runner: externalRunner, externalProcess, outputReference }) : entry.externalAdapter;
+	const childTerminalOutcome = workflowTerminalOutcomeForResult(result) ?? entry.terminalOutcome;
 	if (externalAdapter) resumability = { state: "not-resumable", reason: externalAdapter.nonResumableReason };
 	const updatedEntry: WorkflowReceipt["entries"][string] = resumability.state === "resumable"
 		? {
@@ -174,6 +115,7 @@ function reconcileWorkflowReceipt(status: AsyncStatus, childRunId: string, resul
 			latestRunId: entry.latestRunId ?? childRunId,
 			resumability,
 			...(outputReference ? { outputReference } : {}),
+			...(childTerminalOutcome ? { terminalOutcome: childTerminalOutcome } : {}),
 			...(externalAdapter ? { externalAdapter } : {}),
 		}
 		: {
@@ -182,6 +124,7 @@ function reconcileWorkflowReceipt(status: AsyncStatus, childRunId: string, resul
 			...(step.context ? { resolvedContext: step.context } : {}),
 			resumability,
 			...(outputReference ? { outputReference } : {}),
+			...(childTerminalOutcome ? { terminalOutcome: childTerminalOutcome } : {}),
 			...(externalAdapter ? { externalAdapter } : {}),
 		};
 	const next: WorkflowReceipt = {
@@ -192,7 +135,14 @@ function reconcileWorkflowReceipt(status: AsyncStatus, childRunId: string, resul
 			[key]: updatedEntry,
 		},
 		workflowChildren: status.workflowChildren,
+		...(receipt.terminalOutcome ? { terminalOutcome: receipt.terminalOutcome } : {}),
+		...(resolution ? { workflowResolution: resolution } : {}),
 	};
+	if (resolution) next.recovery = workflowRecoveryActions(next);
+	else {
+		delete next.workflowResolution;
+		delete next.recovery;
+	}
 	writeWorkflowReceipt(asyncDir, next);
 	return next;
 }
@@ -224,15 +174,10 @@ export function reconcileDetachedWorkflowChildCompletion(input: {
 		workflowKey: input.workflowKey,
 	});
 	if (!next) return false;
-	writeAtomicJson(path.join(asyncDir, "status.json"), next);
-	updateActiveRunIndex(asyncDir, next.state, next.toolCallId);
-	if (job) {
-		job.status = next.state;
-		job.updatedAt = next.lastUpdate;
-		job.activityState = next.activityState;
-		job.steps = next.steps?.map((step, index) => ({ ...step, index }));
-		job.workflow = next.workflow;
-	}
+	const outputReference = input.result.savedOutputPath ?? input.result.outputReference?.path;
+	const outputPathMapping = outputPathMappingFromTask(input.result.task, outputReference);
+	const settledStep = findWorkflowSettlementStep(next, input.childRunId, input.workflowKey);
+	if (settledStep && outputPathMapping) settledStep.outputPathMapping = outputPathMapping;
 	const resultPath = resultFilePath(DIRS.results, input.workflowRunId);
 	let existing: Record<string, unknown> | undefined;
 	try {
@@ -243,13 +188,55 @@ export function reconcileDetachedWorkflowChildCompletion(input: {
 	}
 	let receipt: WorkflowReceipt | undefined;
 	let receiptError: string | undefined;
+	const resolution = classifyWorkflowSettlement(next, input.result.interrupted);
 	try {
-		receipt = reconcileWorkflowReceipt(next, input.childRunId, input.result, asyncDir);
+		receipt = reconcileWorkflowReceipt(next, input.childRunId, input.result, asyncDir, resolution);
 	} catch (error) {
 		receiptError = `Failed to reconcile async workflow receipt: ${error instanceof Error ? error.message : String(error)}`;
 	}
-	const published = publishedWorkflowResult(next, input.childRunId, input.result, asyncDir, existing, receipt);
-	writeAsyncResultFile(resultPath, published);
+	const results = workflowResultChildren(next, input.childRunId, input.result, existing?.results, receipt) as WorkflowPublicChild[];
+	const recovery = workflowRecoveryActions(receipt);
+	const summary = `${resolution === "settled-awaiting-resume"
+		? `Workflow lanes settled after detached child ${input.childRunId} finished. JavaScript workflow continuation was not persisted.${recovery.length ? " Use the listed keyed recovery action to continue a child." : " No retained child is resumable."}`
+		: next.state === "complete"
+			? `Workflow completed after detached child ${input.childRunId} finished.`
+			: next.error ?? (typeof existing?.summary === "string" ? existing.summary : "Workflow failed.")}${workflowOutputPathMappingSummary(results)}`;
+	const plan = planWorkflowSettlement({
+		status: next,
+		summary,
+		children: results,
+		baseResult: {
+			...(existing ?? {}),
+			id: next.runId,
+			runId: next.runId,
+			toolCallId: next.toolCallId,
+			agent: "workflow",
+			mode: "workflow",
+			endedAt: next.endedAt,
+			workflow: next.workflow,
+			reconciledFromDetachedChild: input.childRunId,
+			asyncDir,
+			cwd: next.cwd,
+			sessionId: next.sessionId ?? (typeof existing?.sessionId === "string" ? existing.sessionId : undefined),
+			completionOwnerId: next.completionOwnerId,
+		},
+		receipt,
+		receiptPath: path.join(asyncDir, "workflow-receipt.json"),
+		receiptPersistenceError: receiptError,
+		resolution,
+		terminalOutcome: receipt?.terminalOutcome,
+		eventMetadata: { reconciledFromDetachedChild: input.childRunId },
+	});
+	writeAtomicJson(path.join(asyncDir, "status.json"), plan.status);
+	updateActiveRunIndex(asyncDir, plan.status.state, plan.status.toolCallId);
+	if (job) {
+		job.status = plan.status.state;
+		job.updatedAt = plan.status.lastUpdate;
+		job.activityState = plan.status.activityState;
+		job.steps = plan.status.steps?.map((step, index) => ({ ...step, index }));
+		job.workflow = plan.status.workflow;
+	}
+	writeAsyncResultFile(resultPath, plan.publicResult);
 	if (receiptError) {
 		appendDetachedWorkflowEvent(asyncDir, {
 			ts: Date.now(),
@@ -259,14 +246,12 @@ export function reconcileDetachedWorkflowChildCompletion(input: {
 			reconciledFromDetachedChild: input.childRunId,
 		});
 	}
-	if (next.state === "complete" || next.state === "failed") {
+	if (plan.completionEvent) {
 		appendDetachedWorkflowEvent(asyncDir, {
 			ts: Date.now(),
 			runId: input.workflowRunId,
-			type: "subagent.workflow.completed",
-			state: next.state,
-			...(next.error ? { error: next.error } : {}),
-			reconciledFromDetachedChild: input.childRunId,
+			...plan.completionEvent,
+			recovery: plan.recovery,
 		});
 		input.events?.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
 			id: input.workflowRunId,
@@ -274,13 +259,16 @@ export function reconcileDetachedWorkflowChildCompletion(input: {
 			source: "async",
 			mode: "workflow",
 			agent: "workflow",
-			success: next.state === "complete",
-			state: next.state,
-			summary: typeof published.summary === "string" ? published.summary : (next.state === "complete" ? "Workflow completed." : next.error),
+			success: plan.status.state === "complete",
+			state: plan.status.state,
+			...(resolution ? { workflowResolution: resolution } : {}),
+			...(plan.receipt?.terminalOutcome ? { terminalOutcome: plan.receipt.terminalOutcome } : {}),
+			recovery: plan.recovery,
+			summary: typeof plan.publicResult.summary === "string" ? plan.publicResult.summary : plan.status.error,
 			reconciledFromDetachedChild: input.childRunId,
-			...(Array.isArray(published.results) ? { results: published.results } : {}),
-			sessionId: next.sessionId,
-			completionOwnerId: next.completionOwnerId,
+			results,
+			sessionId: plan.status.sessionId,
+			completionOwnerId: plan.status.completionOwnerId,
 			timestamp: Date.now(),
 			triggerTurn: true,
 		});
