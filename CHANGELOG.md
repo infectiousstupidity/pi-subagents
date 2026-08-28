@@ -15,6 +15,7 @@
 
 ### Changed
 - Clarify `workflowScript` contracts: each distinct retained resume pass needs a new stable workflow key, and durable child output paths should use explicit bindings plus returned path metadata.
+- Record attested merge or supersession evidence in existing worktree handoff manifests and render fail-closed cleanup eligibility without performing removal.
 - Show optional lane/work-item context in async status rows, including known phase, gate, next action, output, run reference, and stale/blocked signals without adding render-time I/O.
 - Extract async status snapshot projection into a pure internal module while preserving RPC and widget wire compatibility.
 - Extract child launch planning into a focused internal module shared by async workflow launch setup.
@@ -45,6 +46,7 @@
 - Resume a retained child session once after a provider or transport abort follows useful progress, without restarting the task or involving the parent model.
 
 ### Fixed
+- Retry unused fallback models after a provider reports a plain-text `500` or `internal server error`. Thanks to [@rafafortes](https://github.com/rafafortes) for #1642.
 - Mark missing required child handoffs with useful mutation evidence as partial needs-attention results.
 
 ## [0.58.0] - 2026-08-27
