@@ -25,6 +25,7 @@ import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
+import { validHostStepNodes } from "../shared/host-step-status.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -147,6 +148,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			currentStep: run.currentStep,
 			chainStepCount: run.chainStepCount,
 			parallelGroups: groups,
+			hostSteps: run.hostSteps,
+			preflight: run.preflight,
 			steps: visibleSteps,
 			stepsTotal: visibleSteps.length,
 			runningSteps: visibleSteps.filter((step) => step.status === "running").length,
@@ -399,7 +402,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				job.mode = status.mode;
 				job.parentWorkflowRunId = status.parentWorkflowRunId ?? job.parentWorkflowRunId;
 				job.workflowKey = status.workflowKey ?? job.workflowKey;
+				job.lane = status.lane ?? job.lane;
 				job.workflow = status.workflow ?? job.workflow;
+				job.hostSteps = validHostStepNodes(status.workflowGraph);
 				const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
 				if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
 				job.workflowChildren = workflowChildren ?? job.workflowChildren;

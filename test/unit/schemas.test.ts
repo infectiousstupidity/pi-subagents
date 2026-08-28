@@ -34,6 +34,7 @@ interface SubagentParamsSchema {
 			minLength?: number;
 			description?: string;
 		};
+		preflight?: JsonSchemaNode;
 		chatProgress?: {
 			type?: string;
 			enum?: string[];
@@ -186,6 +187,9 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(workflowScript?.type, "string");
 		assert.equal(workflowScript?.minLength, 1);
 		assert.match(String(workflowScript?.description ?? ""), /runs\.run/);
+		assert.match(String(workflowScript?.description ?? ""), /runs\.lanes\(\[\{key,stages:/);
+		assert.match(String(workflowScript?.description ?? ""), /first stages run together.*later stages sequence per lane/i);
+		assert.match(String(workflowScript?.description ?? ""), /Each workflow key identifies one result lane.*new stable workflow key.*retained resume pass/i);
 		assert.match(String(workflowScript?.description ?? ""), /await runs\.all\(\[\{key, agent, task\}, \.\.\.\]\)/);
 		assert.match(String(workflowScript?.description ?? ""), /do not read \.output from unawaited runs\.run launches/i);
 		assert.match(String(workflowScript?.description ?? ""), /advanced rolling fanout/);
@@ -198,6 +202,13 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(String(workflowScriptPath?.description ?? ""), /mutually exclusive with workflowScript/i);
 		assert.match(String(workflowScriptPath?.description ?? ""), /request cwd/i);
 		assert.match(String(workflowScriptPath?.description ?? ""), /host reads the file/i);
+		const preflight = SubagentParams?.properties?.preflight;
+		assert.equal(preflight?.type, "object");
+		assert.equal(preflight?.additionalProperties, false);
+		assert.match(String(preflight?.description ?? ""), /display-only/i);
+		assert.equal((preflight?.properties as JsonSchemaNode | undefined)?.version?.minimum, 1);
+		assert.equal((preflight?.properties as JsonSchemaNode | undefined)?.version?.maximum, 1);
+		assert.equal((preflight?.properties as JsonSchemaNode | undefined)?.lanes?.maxItems, 64);
 		const chatProgress = SubagentParams?.properties?.chatProgress;
 		assert.equal(chatProgress?.type, "string");
 		assert.deepEqual(chatProgress?.enum, ["auto", "off", "live-card"]);
@@ -220,6 +231,9 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(String((properties?.agent as JsonSchemaNode | undefined)?.description ?? ""), /one-child/i);
 		assert.equal(properties?.clarify, undefined, "clarify should not be model-facing");
 		assert.ok(properties?.output, "output remains a workflow child default");
+		assert.match(String(properties?.output?.description ?? ""), /Relative workflow child paths use managed artifact routing/i);
+		assert.match(String(properties?.output?.description ?? ""), /Task filename prose is not an output declaration/i);
+		assert.match(String(properties?.output?.description ?? ""), /outputReference.*outputPathMapping.*artifactPaths/i);
 	});
 
 	it("omits removed legacy and workflow-child-only fields", () => {

@@ -36,6 +36,43 @@ Use `workflowScriptPath` instead of `workflowScript` to load the same JavaScript
 ` }
 ```
 
+### Parallel sequential lanes
+
+Use `runs.lanes(lanes)` inside a `workflowScript` when several independent lanes each have ordered stages. This helper composes the existing workflow child runner; it does not add a top-level `lanes` parameter or a second persistence/cleanup system.
+
+```js
+{ workflowScript: `
+  const board = await runs.lanes([
+    { key: "api", stages: [
+      { key: "writer", agent: "worker", task: "Implement the API change" },
+      { key: "challenge", resume: "previous", task: "Challenge the implementation" },
+      { key: "review", agent: "reviewer", task: "Review the API lane" }
+    ] },
+    { key: "ui", stages: [
+      { key: "writer", agent: "worker", task: "Implement the UI change" },
+      { key: "review", agent: "reviewer", task: "Review the UI lane" }
+    ] }
+  ]);
+  return board.map((lane) => ({
+    key: lane.key,
+    state: lane.state,
+    failedStage: lane.failedStage,
+    stages: lane.stages.map((stage) => ({
+      key: stage.key,
+      state: stage.state,
+      ok: stage.ok,
+      runId: stage.runId,
+      outputReference: stage.outputReference,
+      verdict: stage.verdict
+    }))
+  }));
+` }
+```
+
+The first stage of each lane is launched by one existing `runs.all(...)` batch. Later stages run in lane order. Set `resume: "previous"` on a later stage to continue the preceding retained child; the helper requires that child’s returned `runId` and delegates to the existing resume checks. Stage keys are local to the lane, and generated child keys are `<lane>.<stage>`.
+
+The complete plain-JSON inventory is validated before the first launch (maximum 32 lanes, 16 stages per lane, 64 total stages, and 64 KiB canonical JSON). A failed, stopped, or detached stage blocks only its lane and marks later stages `skipped`; an explicit `structuredOutput.verdict === "blocked"` has the same effect. Reviewer prose is not parsed. The bounded board returns lane/stage keys, state, `ok`, run ids, explicit output references, bounded errors, and optional verdicts, not transcripts. Use raw `runs.run(...)`/`runs.all(...)` for conditional or rolling workflows.
+
 ## Parameter reference
 
 | Param | Type | Default | Description |
@@ -111,6 +148,8 @@ Use `outputMode: "file-only"` when a saved output may be large and the parent on
 
 In workflowScript, give each child an explicit output path when later script steps need a durable file reference. A child with only read-only tools does not need direct filesystem access for `output`: it returns the complete artifact in its final response and the runtime persists it. Children with mutation-capable tools retain the direct-write instruction.
 
+The `output` field is the API binding; a filename mentioned in task text (for example, `Write your findings to exactly this path: report.md`) is only instruction and does not override runtime routing. When a later workflow step or parent needs a durable file, set `output` on `runs.run`/`runs.all` and return the child’s `outputReference`, `outputPathMapping`, or `artifactPaths`; arbitrary literal strings returned by workflow JavaScript are not rewritten. Omitted child output may use a managed aggregate-derived sibling path.
+
 Workflows get `await state.get(key)` and `await state.set(key, value)` through their default or explicit mission. Use them to share durable JSON values across later workflows attached with the same `missionId`. Each `set` takes the state-file lock and merges its key with the latest on-disk state. Missing keys return `undefined`, and the complete state file has a strict 256 KiB limit. `mission:false` workflows have no `state` global.
 
 ### Retained children
@@ -127,6 +166,8 @@ Completed workflow children from the current parent session stay addressable as 
   return writer;
 ` }
 ```
+
+Each workflow key identifies one result lane. Use a new stable workflow key for every distinct retained resume pass; same-key calls are reused only when launch parameters are identical, and incompatible parameters are rejected.
 
 Inside `workflowScript`, `await runs.run(key, { resume, task })` waits for the revived child to finish and returns its completed output and new `runId`. Each resume can return a new retained run id, so loops must continue from the latest returned `runId`. Top-level `{ action: "resume" }` remains detached and returns a background-run receipt.
 

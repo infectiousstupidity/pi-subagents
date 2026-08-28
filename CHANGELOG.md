@@ -3,11 +3,18 @@
 ## [Unreleased]
 
 ### Added
+- Add bounded, provider-agnostic host-owned CI and gate workflow rows with explicit monitor kinds, terminal verdicts, stale freshness, report pointers, and fail-closed status/receipt projection.
+- Persist bounded workflow lane metadata across child status, terminal receipts, and existing worktree handoff manifests, including display-only worktree paths and branches without adding a lane registry or cleanup authority; write pending worktree ownership evidence before creation to avoid crash orphan gaps.
+- Add `runs.lanes(...)` for bounded parallel sequential workflow stages with per-lane results and retained-resume support (#1633).
+- Add bounded, display-only `preflight` lane metadata for workflowScript launches, with advisory coverage warnings and planned-lane rendering in launch, status, and live-card views.
+- Give every subagent child session a human-readable display name (`agent: task excerpt`, workflow node label preferred): applied to the child's own Pi session via `pi.setSessionName` (intercom routing targets keep precedence) and echoed as an optional `sessionName` field across result, live-progress, async status, workflow, nested, and intercom payloads so hosts can label child runs without reading child session files. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1615.
 - Add `/subagents-steer <run-id> [--child <child-id>] <message>`, a host bridge for steering live async runs from non-TUI sessions and RPC hosts, with fail-closed child-id resolution and pause-and-revive recovery disabled so callers keep exact-child authority. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1608.
 - Add explicit `allowNestedSubagents` agent authorization for nested fanout without replacing inherited tools or extensions. Thanks to [@tutu359](https://github.com/tutu359) for #1587.
 - Accept a child id on `/subagents-stop <run-id> <child-id>` so RPC hosts and non-TUI sessions can stop one child of a multi-child async run or workflow without stopping the whole run. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1603.
 
 ### Changed
+- Clarify `workflowScript` contracts: each distinct retained resume pass needs a new stable workflow key, and durable child output paths should use explicit bindings plus returned path metadata.
+- Show optional lane/work-item context in async status rows, including known phase, gate, next action, output, run reference, and stale/blocked signals without adding render-time I/O.
 - Extract async status snapshot projection into a pure internal module while preserving RPC and widget wire compatibility.
 - Extract child launch planning into a focused internal module shared by async workflow launch setup.
 - Extract detached workflow settlement planning into a focused workflow module while preserving fail-closed result handoff.
@@ -17,7 +24,15 @@
 - Show workflow child labels and phases in async status progress while preserving stable workflow keys.
 
 ### Fixed
+- Keep an async `workflowScript` continuation live while an awaited child coordinates with its supervisor, so sequential tail steps continue after the child settles (#1634).
+- Stop stale extension and slash-command contexts from escaping during reload or session replacement.
+- Include saved workflow child output paths and bounded inline previews in completion notices (#1629).
+- Format million-scale context limits as `1M` instead of `1000k` in live status displays.
+- Restore active workflow children under their workflow parent in Fleet Status after reload, while keeping unmatched shell rows visible.
+- Prefer loaded workspace context over repeated internal workflow keys in async TUI lane rows (#1619).
+- Accept path-like Pi session ids up to 4,096 characters when snapshotting background work. Thanks to [@dvishoot](https://github.com/dvishoot) for #1616.
 - Accept bare leaf model ids reported by provider drivers when verifying provider-qualified launch candidates. Thanks to [@lallenlowe](https://github.com/lallenlowe) for #1609.
+- Resume compaction-induced child aborts once when retained state is safe, and report the exact recovery blocker otherwise.
 - Report aborted or signalled no-output child runs with their terminal stop, stderr, or process signal before missing-output handoff diagnostics.
 - Apply `globalConcurrencyLimit` to `workflowScript` children launched through `runs.run` and `runs.all`, not only legacy multi-child runners. Thanks to [@mateominato](https://github.com/mateominato) for #1600.
 - Ignore nested `.pi` and `sync-backups` directories during agent discovery so stale backup definitions cannot become executable agents. Thanks to [@arlishansenn](https://github.com/arlishansenn) for #1596.

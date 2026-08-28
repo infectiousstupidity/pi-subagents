@@ -4,6 +4,8 @@ import { writePrivateAtomicJson } from "../shared/atomic-json.ts";
 import type { ExternalCliReceiptMetadata, WorkflowReceipt, WorkflowReceiptEntry, WorkflowReceiptState, WorkflowRecoveryAction, WorkflowTerminalOutcome, WorkflowTerminalResolution } from "../shared/types.ts";
 import type { WorkflowReceiptResumeReference, WorkflowScriptChildResult } from "./scripted-workflow.ts";
 import { parseWorkflowChildSummary } from "./workflow-child-summary.ts";
+import { HOST_STEP_MAX_COUNT, assertUniqueHostStepIds, parseHostStepNode } from "../runs/shared/host-step-status.ts";
+import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../runs/shared/lane-metadata.ts";
 
 export type { WorkflowReceipt, WorkflowReceiptEntry, WorkflowReceiptState } from "../shared/types.ts";
 
@@ -33,6 +35,7 @@ export function buildWorkflowReceipt(input: {
 	workflowRunId: string;
 	state: WorkflowReceiptState;
 	children: WorkflowScriptChildResult[];
+	hostSteps?: WorkflowReceipt["hostSteps"];
 	workflowChildren?: WorkflowReceipt["workflowChildren"];
 	terminalOutcome?: WorkflowTerminalOutcome;
 	createdAt?: number;
@@ -43,12 +46,15 @@ export function buildWorkflowReceipt(input: {
 	for (const child of input.children) {
 		const key = assertKey(child.key, "workflow receipt child key");
 		if (entries[key]) throw new Error(`Workflow receipt has duplicate child key '${key}'.`);
+		const lane = normalizeWorkflowLaneMetadata(child.lane, `workflow receipt child '${key}'.lane`);
+		assertWorkflowLaneKey(lane, key, `workflow receipt child '${key}'.lane`);
 		const runIds = [...new Set((child.continuation?.runIds ?? (child.runId ? [child.runId] : [])).filter((runId) => typeof runId === "string" && runId.trim()).map((runId) => runId.trim()))];
 		const latestRunId = runIds.at(-1);
 		const resumability = child.resumability ?? { state: "not-resumable", reason: child.runId ? "resumability was not recorded" : "child produced no run id" };
 		if (resumability.state === "resumable" && !latestRunId) throw new Error(`Workflow receipt child '${key}' is resumable but has no retained run id.`);
 		const base = {
 			key,
+			...(lane ? { lane } : {}),
 			...(child.terminalOutcome ? { terminalOutcome: child.terminalOutcome } : {}),
 			...(child.agent ? { agent: child.agent } : {}),
 			...(child.requestedContext ? { requestedContext: child.requestedContext } : {}),
@@ -61,7 +67,10 @@ export function buildWorkflowReceipt(input: {
 			? { ...base, latestRunId: latestRunId!, resumability }
 			: { ...base, ...(latestRunId ? { latestRunId } : {}), resumability };
 	}
-	return { version: WORKFLOW_RECEIPT_VERSION, workflowRunId, state: input.state, createdAt: input.createdAt ?? Date.now(), entries, ...(input.workflowChildren ? { workflowChildren: input.workflowChildren } : {}), ...(input.terminalOutcome ? { terminalOutcome: input.terminalOutcome } : {}) };
+	if (input.hostSteps && input.hostSteps.length > HOST_STEP_MAX_COUNT) throw new Error(`Workflow receipt has more than ${HOST_STEP_MAX_COUNT} host steps.`);
+	const hostSteps = input.hostSteps?.map((hostStep, index) => parseHostStepNode(hostStep, `workflow receipt hostSteps[${index}]`));
+	if (hostSteps) assertUniqueHostStepIds(hostSteps, "workflow receipt");
+	return { version: WORKFLOW_RECEIPT_VERSION, workflowRunId, state: input.state, createdAt: input.createdAt ?? Date.now(), entries, ...(hostSteps?.length ? { hostSteps } : {}), ...(input.workflowChildren ? { workflowChildren: input.workflowChildren } : {}), ...(input.terminalOutcome ? { terminalOutcome: input.terminalOutcome } : {}) };
 }
 
 export function writeWorkflowReceipt(asyncDir: string, receipt: WorkflowReceipt): string {
@@ -202,7 +211,9 @@ function parseEntry(value: unknown, key: string, source: string): WorkflowReceip
 	if (state === "not-resumable" && (typeof reason !== "string" || !reason.trim())) throw new Error(`Invalid workflow receipt '${source}': entry '${key}' non-resumable reason is missing.`);
 	const terminalOutcome = parseTerminalOutcome(entry.terminalOutcome, `Invalid workflow receipt '${source}': entry '${key}' terminalOutcome`);
 	parseExternalCliReceiptMetadata(entry.externalAdapter, key, source);
-	return { ...(value as WorkflowReceiptEntry), ...(terminalOutcome ? { terminalOutcome } : {}) };
+	const lane = normalizeWorkflowLaneMetadata(entry.lane, `Invalid workflow receipt '${source}': entry '${key}'.lane`);
+	assertWorkflowLaneKey(lane, key, `Invalid workflow receipt '${source}': entry '${key}'.lane`);
+	return { ...(value as WorkflowReceiptEntry), ...(lane ? { lane } : {}), ...(terminalOutcome ? { terminalOutcome } : {}) };
 }
 
 function parseWorkflowResolution(value: unknown, source: string): WorkflowTerminalResolution | undefined {
@@ -254,10 +265,17 @@ export function readWorkflowReceipt(asyncDirRoot: string, workflowRunId: string)
 	for (const [key, entry] of Object.entries(receipt.entries as Record<string, unknown>)) entries[assertKey(key, "workflow receipt key")] = parseEntry(entry, key, receiptPath);
 	const workflowChildren = parseWorkflowChildSummary(receipt.workflowChildren);
 	if (workflowChildren && workflowChildren.workflowRunId !== workflowRunId) throw new Error(`Workflow receipt '${receiptPath}' is stale: workflowChildren.workflowRunId does not match.`);
+	let hostSteps: NonNullable<WorkflowReceipt["hostSteps"]> | undefined;
+	if (receipt.hostSteps !== undefined) {
+		if (!Array.isArray(receipt.hostSteps)) throw new Error(`Invalid workflow receipt '${receiptPath}': hostSteps must be an array.`);
+		if (receipt.hostSteps.length > HOST_STEP_MAX_COUNT) throw new Error(`Invalid workflow receipt '${receiptPath}': hostSteps exceeds ${HOST_STEP_MAX_COUNT} entries.`);
+		hostSteps = receipt.hostSteps.map((hostStep, index) => parseHostStepNode(hostStep, `${receiptPath} hostSteps[${index}]`));
+		assertUniqueHostStepIds(hostSteps, receiptPath);
+	}
 	const workflowResolution = parseWorkflowResolution(receipt.workflowResolution, receiptPath);
 	const terminalOutcome = parseTerminalOutcome(receipt.terminalOutcome, `Invalid workflow receipt '${receiptPath}': terminalOutcome`);
 	const recovery = parseRecovery(receipt.recovery, workflowRunId, entries, receiptPath);
-	return { version: 1, workflowRunId, state: receipt.state, createdAt: receipt.createdAt, entries, ...(workflowChildren ? { workflowChildren } : {}), ...(workflowResolution ? { workflowResolution } : {}), ...(terminalOutcome ? { terminalOutcome } : {}), ...(recovery ? { recovery } : {}) };
+	return { version: 1, workflowRunId, state: receipt.state, createdAt: receipt.createdAt, entries, ...(hostSteps?.length ? { hostSteps } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(workflowResolution ? { workflowResolution } : {}), ...(terminalOutcome ? { terminalOutcome } : {}), ...(recovery ? { recovery } : {}) };
 }
 
 export function resolveWorkflowReceiptResumeEntry(input: {

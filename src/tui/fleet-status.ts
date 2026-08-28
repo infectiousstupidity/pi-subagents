@@ -2,9 +2,10 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type EditorComponent, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { snapshotExternalRuns } from "../api/external-runs.ts";
 import { formatModelThinking } from "../shared/formatters.ts";
-import type { AsyncJobState, AsyncJobStep, FleetViewPlacement, HerdrProjectPaneSnapshot, NestedRunSummary, NestedStepSummary, SubagentState } from "../shared/types.ts";
+import type { AsyncJobState, AsyncJobStep, FleetViewPlacement, HerdrProjectPaneSnapshot, HostStepState, HostStepVerdict, NestedRunSummary, NestedStepSummary, SubagentState } from "../shared/types.ts";
 import { projectAsyncWorkflowRows, type AsyncStatusWorkflowRow } from "../runs/shared/async-status-projection.ts";
 import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
+import { hostStepReportName, hostStepVerdictLabel } from "../runs/shared/host-step-status.ts";
 
 export const FLEET_STATUS_WIDGET_KEY = "subagent-fleet-status";
 
@@ -106,7 +107,7 @@ function visibleWorkflowRows(rows: AsyncStatusWorkflowRow[] | undefined, visible
 	if (rows.length <= visibleLimit) return rows;
 	const selected = new Set<number>();
 	for (const [index, row] of rows.entries()) {
-		if (row.state !== "complete" && row.state !== "completed") selected.add(index);
+		if (!isWorkflowRowTerminal(row)) selected.add(index);
 		if (selected.size >= visibleLimit) break;
 	}
 	for (let index = rows.length - 1; index >= 0 && selected.size < visibleLimit; index--) selected.add(index);
@@ -114,9 +115,14 @@ function visibleWorkflowRows(rows: AsyncStatusWorkflowRow[] | undefined, visible
 	return [{ name: `… +${rows.length - visible.length} hidden workflow steps`, state: "complete", overflow: rows.length - visible.length }, ...visible];
 }
 
-function nestedStatusGlyph(state: FleetNestedRow["state"], theme: Theme): string {
+function isWorkflowRowTerminal(row: AsyncStatusWorkflowRow): boolean {
+	if (row.kind) return row.state === "done" || row.state === "cancelled" || row.state === "error";
+	return row.state === "complete" || row.state === "completed";
+}
+
+function nestedStatusGlyph(state: FleetNestedRow["state"] | "planned", theme: Theme): string {
 	if (state === "running") return theme.fg("accent", "●");
-	if (state === "queued" || state === "pending") return theme.fg("muted", "◦");
+	if (state === "queued" || state === "pending" || state === "planned") return theme.fg("muted", "◦");
 	if (state === "complete" || state === "completed") return theme.fg("success", "✓");
 	if (state === "failed" || state === "rejected") return theme.fg("error", "✗");
 	return theme.fg("warning", "■");
@@ -248,6 +254,25 @@ function foregroundDescription(control: { parentWorkflowRunId?: string; workflow
 	return description ? `${workflow} · ${description}` : workflow;
 }
 
+function workflowIdentityCandidates(step: Pick<AsyncJobStep, "workflowKey" | "runId">): string[] {
+	return [...new Set([step.workflowKey, step.runId].filter((value): value is string => typeof value === "string" && value.length > 0))];
+}
+
+function asyncJobIdentityCandidates(job: AsyncJobState): string[] {
+	return [...new Set([job.workflowKey, job.asyncId].filter((value): value is string => typeof value === "string" && value.length > 0))];
+}
+
+function linkedWorkflowParentKey(parentWorkflowRunId: string | undefined, activeWorkflowKeys: ReadonlySet<string>): string | undefined {
+	if (!parentWorkflowRunId) return undefined;
+	const parentKey = `async:${parentWorkflowRunId}`;
+	return activeWorkflowKeys.has(parentKey) ? parentKey : undefined;
+}
+
+function workflowStepsWithoutMaterializedChildren(steps: AsyncJobStep[] | undefined, materializedChildIds: ReadonlySet<string> | undefined): AsyncJobStep[] | undefined {
+	if (!steps?.length || !materializedChildIds?.size) return steps;
+	return steps.filter((step) => !workflowIdentityCandidates(step).some((identity) => materializedChildIds.has(identity)));
+}
+
 function activeLeafAgentCount(entries: FleetStatusEntry[]): number {
 	return entries.filter((entry) => !entry.workflowWrapper && !entry.surface).length;
 }
@@ -282,9 +307,17 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 	const activeWorkflowKeys = new Set([...state.asyncJobs.values()]
 		.filter((job) => job.mode === "workflow" && isActiveState(job.status))
 		.map((job) => `async:${job.asyncId}`));
+	const materializedChildrenByWorkflow = new Map<string, Set<string>>();
+	for (const job of state.asyncJobs.values()) {
+		if (!isActiveState(job.status) || !job.parentWorkflowRunId) continue;
+		const parentKey = linkedWorkflowParentKey(job.parentWorkflowRunId, activeWorkflowKeys);
+		if (!parentKey) continue;
+		const childIds = materializedChildrenByWorkflow.get(parentKey) ?? new Set<string>();
+		for (const identity of asyncJobIdentityCandidates(job)) childIds.add(identity);
+		materializedChildrenByWorkflow.set(parentKey, childIds);
+	}
 	for (const control of state.foregroundControls.values()) {
-		const parentKey = control.parentWorkflowRunId ? `async:${control.parentWorkflowRunId}` : undefined;
-		const linkedParentKey = parentKey && activeWorkflowKeys.has(parentKey) ? parentKey : undefined;
+		const linkedParentKey = linkedWorkflowParentKey(control.parentWorkflowRunId, activeWorkflowKeys);
 		if (control.activeChildren) {
 			for (const child of [...control.activeChildren.values()].sort((left, right) => left.index - right.index)) {
 				const modelThinking = formatModelThinking(child.model, child.thinking) || undefined;
@@ -323,10 +356,14 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 	for (const job of state.asyncJobs.values()) {
 		if (!isActiveState(job.status)) continue;
 		const startedAt = job.startedAt ?? job.updatedAt ?? Date.now();
+		const linkedParentKey = linkedWorkflowParentKey(job.parentWorkflowRunId, activeWorkflowKeys);
 		if (job.mode === "workflow") {
 			const latestEmit = job.workflow?.emits?.length ? formatWorkflowJsonPreview(job.workflow.emits.at(-1), 120) : undefined;
+			const workflowSteps = workflowStepsWithoutMaterializedChildren(job.steps, materializedChildrenByWorkflow.get(`async:${job.asyncId}`));
+			const workflowRows = projectAsyncWorkflowRows(workflowSteps, job.hostSteps, job.preflight);
 			entries.push({
 				key: `async:${job.asyncId}`,
+				...(linkedParentKey ? { parentKey: linkedParentKey } : {}),
 				workflowWrapper: true,
 				agent: "workflow",
 				description: latestEmit !== undefined ? `latest emit: ${latestEmit}` : job.description,
@@ -334,7 +371,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 				tokens: job.totalTokens?.total ?? 0,
 				...(job.totalTokens?.window !== undefined ? { window: job.totalTokens.window } : {}),
 				state: job.status,
-				...(job.steps?.length ? { workflowRows: projectAsyncWorkflowRows(job.steps) } : {}),
+				...(workflowRows.length ? { workflowRows } : {}),
 				...(job.nestedChildren?.length ? { nestedChildren: job.nestedChildren } : {}),
 			});
 			continue;
@@ -349,6 +386,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 		if (!steps?.length) {
 			entries.push({
 				key: `async:${job.asyncId}`,
+				...(linkedParentKey ? { parentKey: linkedParentKey } : {}),
 				agent: job.mode ?? "subagent",
 				description: job.description,
 				startedAt,
@@ -366,6 +404,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 			const modelThinking = formatModelThinking(step.model, step.thinking) || undefined;
 			entries.push({
 				key: `async:${job.asyncId}:${index}`,
+				...(linkedParentKey ? { parentKey: linkedParentKey } : {}),
 				agent: step.label ? `${step.label} (${step.agent})` : step.agent,
 				...(modelThinking ? { modelThinking } : {}),
 				description: step.description ?? job.description,
@@ -660,16 +699,50 @@ export class SubagentFleetStatus {
 		return truncateToWidth(`${left}${theme.fg("dim", elapsed)}`, width);
 	}
 
+	private workflowRowGlyph(row: AsyncStatusWorkflowRow, theme: Theme): string {
+		if (!row.kind) return nestedStatusGlyph(row.state as FleetNestedRow["state"], theme);
+		const state = row.state as HostStepState;
+		if (state === "pending") return theme.fg("muted", "◦");
+		if (state === "running") return theme.fg("accent", "●");
+		if (state === "done") return row.verdict === "pass" ? theme.fg("success", "✓") : row.verdict === "fail" ? theme.fg("error", "✗") : theme.fg("warning", "■");
+		if (state === "error") return theme.fg("error", "✗");
+		return theme.fg("warning", "■");
+	}
+
+	private workflowRowStateLabel(row: AsyncStatusWorkflowRow, theme: Theme): string {
+		const state = row.kind ? hostStepVerdictLabel(row.state as HostStepState, row.verdict as HostStepVerdict | undefined) : row.state;
+		if (state === "running") return theme.fg("accent", state);
+		if (state === "pending" || state === "queued") return theme.fg("muted", state);
+		if (state === "pass" || state === "complete" || state === "completed") return theme.fg("success", state === "pass" ? "pass" : "complete");
+		if (state === "fail" || state === "failed" || state === "error") return theme.fg("error", state === "fail" ? "fail" : state);
+		return theme.fg("warning", state);
+	}
+
 	private renderWorkflowRow(row: AsyncStatusWorkflowRow, last: boolean, width: number, theme: Theme): string {
 		const marker = last ? "└─" : "├─";
 		const indent = "    ";
 		if (row.overflow !== undefined) return truncateToWidth(`${indent}${marker} ${theme.fg("dim", `+${row.overflow} hidden workflow steps`)}`, width);
 		const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
 		const activity = row.activity ? ` · ${row.activity}` : "";
-		const left = `${indent}${marker} ${nestedStatusGlyph(row.state, theme)} ${theme.fg("muted", `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
+		const kind = row.kind ? `${row.kind}: ` : "";
+		const hints = row.preflight ? [
+			row.preflight.mode ? `mode:${row.preflight.mode}` : undefined,
+			row.preflight.decision ? `decision:${row.preflight.decision}` : undefined,
+			row.preflight.claims?.length ? `claims:${row.preflight.claims.join(",")}` : undefined,
+			row.preflight.expectedOutput ? `expected:${row.preflight.expectedOutput}` : undefined,
+			row.preflight.independence ? `independence:${row.preflight.independence}` : undefined,
+		].filter((value): value is string => Boolean(value)).join(" · ") : "";
+		const left = `${indent}${marker} ${this.workflowRowGlyph(row, theme)} ${theme.fg("muted", `${kind}${row.name}${modelThinking}`)} · ${this.workflowRowStateLabel(row, theme)}${activity}${hints ? ` · ${hints}` : ""}`;
 		const details = [
 			row.startedAt !== undefined ? formatFleetElapsed(Date.now() - row.startedAt) : undefined,
 			row.tokens !== undefined ? formatFleetTokens(row.tokens, row.window) : undefined,
+			row.provider ? `provider:${row.provider}` : undefined,
+			row.role ? `role:${row.role}` : undefined,
+			row.target,
+			row.detail,
+			row.reasonCode ? `reason:${row.reasonCode}` : undefined,
+			row.freshness?.stale ? "stale" : row.freshness?.observedRef ? `ref:${row.freshness.observedRef}` : undefined,
+			row.reportPath ? `out:${hostStepReportName(row.reportPath)}` : undefined,
 		].filter(Boolean).join(" · ");
 		return truncateToWidth(`${left}${details ? theme.fg("dim", ` · ${details}`) : ""}`, width);
 	}
@@ -724,12 +797,21 @@ export class SubagentFleetStatus {
 					Math.round((now - entry.startedAt) / 1000),
 					entry.tokens,
 					visibleWorkflowRows(entry.workflowRows, entry.parentKey ? 2 : 4).map((row) => [
+						row.kind,
 						row.name,
 						row.state,
 						row.modelThinking,
 						row.activity,
 						row.startedAt,
 						row.tokens,
+						row.provider,
+						row.role,
+						row.verdict,
+						row.reasonCode,
+						row.detail,
+						row.target,
+						row.freshness,
+						row.reportPath,
 						row.overflow,
 					]),
 					nestedFleetRows(entry.nestedChildren, entry.parentKey ? 3 : 4).map((row) => [

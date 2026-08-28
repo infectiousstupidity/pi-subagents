@@ -6,6 +6,8 @@ export interface RunnerSubagentStep {
 	/** Resolved opt-in rules for native Pi child tool calls. */
 	permissionRules?: import("./permissions.ts").PermissionRules;
 	agent: string;
+	/** Human-readable display name for the child session, derived internally at launch. */
+	sessionName?: string;
 	task: string;
 	runner?: ResolvedRunnerConfig;
 	externalJobFollowUp?: {
@@ -90,6 +92,8 @@ export interface RunnerSubagentStep {
 	runFanoutPath?: string;
 	/** Run this single child in one managed worktree. */
 	worktree?: boolean;
+	/** Bounded launch-declared lane metadata; display/triage only. */
+	lane?: import("../../shared/types.ts").WorkflowLaneMetadata;
 }
 
 export interface ParallelStepGroup {

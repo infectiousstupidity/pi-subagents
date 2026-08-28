@@ -8,6 +8,7 @@ import { DIRS, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSu
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { nestedSummaryFromAsyncStatus, projectNestedEvents, resolveNestedAsyncDir, writeNestedEvent, type NestedRoute } from "../shared/nested-events.ts";
+import { assertWorkflowGraphHostSteps } from "../shared/host-step-status.ts";
 
 export type PidLiveness = "alive" | "dead" | "unknown";
 
@@ -24,6 +25,7 @@ interface StartedRunMetadata {
 	parallelGroups?: AsyncParallelGroupStatus[];
 	startedAt?: number;
 	sessionFile?: string;
+	sessionName?: string;
 }
 
 interface ReconcileAsyncRunOptions {
@@ -90,6 +92,7 @@ function appendJsonlBestEffort(filePath: string, payload: object): void {
 
 interface ResultChildOutcome {
 	agent?: string;
+	sessionName?: string;
 	success?: boolean;
 	error?: string;
 	sessionFile?: string;
@@ -159,6 +162,7 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 			exitCode: step.exitCode ?? (state === "complete" || state === "paused" ? 0 : 1),
 			error: state === "failed" || state === "partial" || state === "stopped" ? step.error ?? child?.error : step.error,
 			stopped: state === "stopped" ? true : step.stopped,
+			sessionName: step.sessionName ?? child?.sessionName,
 			sessionFile: step.sessionFile ?? child?.sessionFile,
 			model,
 			thinking,
@@ -254,6 +258,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 			summary: message,
 			results: repairedSteps.map((step) => ({
 				agent: step.agent,
+				...(step.sessionName ? { sessionName: step.sessionName } : {}),
 				output: step.status === "complete" || step.status === "completed" ? "" : message,
 				error: step.status === "complete" || step.status === "completed" ? undefined : step.error ?? message,
 				success: step.status === "complete" || step.status === "completed",
@@ -353,6 +358,7 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;
 	if (!effectiveStatus) return { status: null, repaired: false };
+	assertWorkflowGraphHostSteps(effectiveStatus.workflowGraph, path.join(asyncDir, "status.json"), effectiveStatus.runId);
 	const statusPath = path.join(asyncDir, "status.json");
 	for (const [index, step] of (effectiveStatus.steps ?? []).entries()) {
 		const stepRecord = step as Record<string, unknown>;
