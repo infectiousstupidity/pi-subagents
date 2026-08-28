@@ -3,6 +3,9 @@ import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/parallel-utils.ts";
+import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
+import type { HostStepNodeV1, SingleResult } from "../shared/types.ts";
+import { normalizeWorkflowHostCommandParams, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "./host-command.ts";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const requireFromPackage = createRequire(import.meta.url);
@@ -253,11 +256,11 @@ function hostCall(method, args, observation) {
     : promise;
 }
 
-function runHostCall(key, params, collectFailure, batch) {
+function runHostCall(key, params, collectFailure, batch, generatedLaneKey) {
   const callId = ++nextCallId;
   const promise = new Promise((resolve, reject) => {
     pending.set(callId, { resolve, reject });
-    parentPort.postMessage({ type: "call", callId, method: "run", args: { key, params, ...(collectFailure ? { collectFailure: true } : {}), ...(batch ? { batch } : {}) } });
+    parentPort.postMessage({ type: "call", callId, method: "run", args: { key, params, ...(collectFailure ? { collectFailure: true } : {}), ...(batch ? { batch } : {}), ...(generatedLaneKey ? { generatedLaneKey } : {}) } });
   });
   return { key, callId, promise };
 }
@@ -374,9 +377,9 @@ function laneFailure(stageKey, error) {
   return { key: stageKey, ok: false, output: text, error: text, artifactPaths: [] };
 }
 
-function runCollected(key, params, observe) {
+function runCollected(key, params, observe, generatedLaneKey) {
   validateRunCall(key, params, "runs.lanes stage", runFingerprints);
-  const launched = runHostCall(key, params, true);
+  const launched = runHostCall(key, params, true, undefined, generatedLaneKey);
   observe([{ key, operation: "run", callId: launched.callId }]);
   return launched.promise.then(decorateWorkflowChildResult);
 }
@@ -416,7 +419,12 @@ function validateLaneSpecs(laneSpecs) {
       if (generatedKeys.has(generatedKey)) throw new Error("runs.lanes generated child key '" + generatedKey + "' is duplicated.");
       generatedKeys.add(generatedKey);
       const resume = stage.resume;
-      if (resume !== undefined && resume !== "previous") throw new Error(stageLabel + " resume must be 'previous'.");
+      if (resume !== undefined && resume !== "previous") {
+        if (stageIndex === 0 && typeof resume === "string") {
+          throw new Error(stageLabel + " cannot resume a retained run id in runs.lanes; use runs.run(key, { resume: id }) outside lanes, or start the lane with an agent stage and use resume: \"previous\" later.");
+        }
+        throw new Error(stageLabel + " resume must be 'previous'.");
+      }
       if (stageIndex === 0 && resume === "previous") throw new Error(stageLabel + " cannot resume previous without a predecessor stage.");
       const { key: _stageKey, resume: _resume, ...params } = stage;
       const validationParams = resume === "previous" ? { ...params, resume: "retained-run-placeholder" } : params;
@@ -469,7 +477,7 @@ function runLane(lane, firstResult, observe) {
     }
     let launched;
     try {
-      launched = runCollected(stage.generatedKey, params, observe);
+      launched = runCollected(stage.generatedKey, params, observe, lane.key);
     } catch (error) {
       const failed = laneFailure(stage.generatedKey, error);
       records.push(laneStageRecord(stage.key, failed));
@@ -499,7 +507,7 @@ function runLanes(laneSpecs) {
     return { key: first.generatedKey, ...first.params };
   });
   // Share the runs.all batch launcher while allowing each lane to advance independently.
-  const firstBatch = launchRunsAll(firstItems);
+  const firstBatch = launchRunsAll(firstItems, lanes.map((lane) => lane.key));
   const firstResults = firstBatch.launched.map(({ promise }) => promise.then(decorateWorkflowChildResult));
   let trackedAggregate;
   const observe = (observations) => trackRunObservation(observations, trackedAggregate);
@@ -576,6 +584,7 @@ function validateLaneMetadata(value, label, workflowKey) {
 
 function validateRunCall(key, params, label, fingerprints) {
   if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error(label + " has an invalid key.");
+  if (hostKeys.has(key)) throw new Error("Workflow key '" + key + "' is already used by runs.host.");
   if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error(label + " requires a params object.");
   if (Object.prototype.hasOwnProperty.call(params, "action") || Object.prototype.hasOwnProperty.call(params, "workflowScript") || Object.prototype.hasOwnProperty.call(params, "tasks") || Object.prototype.hasOwnProperty.call(params, "chain") || Object.prototype.hasOwnProperty.call(params, "parallel") || Object.prototype.hasOwnProperty.call(params, "concurrency") || Object.prototype.hasOwnProperty.call(params, "chainDir")) {
     const hint = label === "runs.run" ? "; use runs.all(...) and JavaScript control flow for orchestration." : ".";
@@ -608,7 +617,27 @@ function validateRunCall(key, params, label, fingerprints) {
   fingerprints.set(key, fingerprint);
 }
 
-function launchRunsAll(items) {
+const hostKeys = new Set();
+
+function validateHostCommand(key, params) {
+  validateLaneKey(key, "runs.host");
+  if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("runs.host('" + key + "') params must be an object.");
+  const allowed = new Set(["kind", "command", "timeoutMs", "output", "role", "provider"]);
+  const unknown = Object.keys(params).filter((field) => !allowed.has(field));
+  if (unknown.length) throw new Error("runs.host('" + key + "') params have unsupported fields: " + unknown.join(", ") + ".");
+  if (params.kind !== "command") throw new Error("runs.host('" + key + "') kind must be 'command'.");
+  if (typeof params.command !== "string" || !params.command.trim() || params.command.includes("\u0000") || new TextEncoder().encode(params.command.trim()).byteLength > 16384) throw new Error("runs.host('" + key + "') command must be a non-empty string of at most 16384 bytes without NUL.");
+  if (!Number.isInteger(params.timeoutMs) || params.timeoutMs < 1 || params.timeoutMs > 86400000) throw new Error("runs.host('" + key + "') timeoutMs must be an integer from 1 to 86400000.");
+  if (params.output !== undefined && (typeof params.output !== "string" || !params.output.trim() || /^[/\\]|(?:^|[/\\])\.\.(?:[/\\]|$)/.test(params.output) || /[\u0000-\u001f\u007f]/.test(params.output) || new TextEncoder().encode(params.output.trim()).byteLength > 240)) throw new Error("runs.host('" + key + "') output must be a bounded relative path without traversal or control characters.");
+  if (params.role !== undefined && params.role !== "ci" && params.role !== "gate") throw new Error("runs.host('" + key + "') role must be 'ci' or 'gate'.");
+  if (params.provider !== undefined && (typeof params.provider !== "string" || !params.provider.trim() || /[\r\n\u0000]/.test(params.provider) || new TextEncoder().encode(params.provider.trim()).byteLength > 64)) throw new Error("runs.host('" + key + "') provider must be a non-empty single-line string of at most 64 bytes.");
+  assertJsonValue(params, "runs.host('" + key + "') params");
+  if (hostKeys.has(key) || runFingerprints.has(key)) throw new Error("Workflow key '" + key + "' is already in use.");
+  if (hostKeys.size >= 32) throw new Error("workflowScript supports at most 32 runs.host calls.");
+  hostKeys.add(key);
+}
+
+function launchRunsAll(items, generatedLaneKeys) {
   if (!Array.isArray(items)) throw new Error("runs.all(items) requires an array.");
   const fingerprints = new Map(runFingerprints);
   const calls = [];
@@ -622,7 +651,7 @@ function launchRunsAll(items) {
   }
   runFingerprints = fingerprints;
   const batch = { id: "batch-" + (++nextCallId), calls };
-  const launched = calls.map(({ key, params }) => runHostCall(key, params, true, batch));
+  const launched = calls.map(({ key, params }, index) => runHostCall(key, params, true, batch, generatedLaneKeys?.[index]));
   return { calls, launched };
 }
 
@@ -638,6 +667,10 @@ const runs = Object.freeze({
   },
   lanes(laneSpecs) {
     return runLanes(laneSpecs);
+  },
+  host(key, params) {
+    validateHostCommand(key, params);
+    return hostCall("host", { key, params }, { key, operation: "host" });
   },
   steer(key, message, options = {}) {
     if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error("runs.steer has an invalid key.");
@@ -924,11 +957,11 @@ export interface WorkflowScriptChildResult {
 	resumability?: { state: "resumable" } | { state: "not-resumable"; reason: string };
 	continuation?: { runIds: string[] };
 	artifactPaths: string[];
-	results?: unknown[];
+	results?: SingleResult[];
 }
 
 export interface WorkflowScriptTraceEntry {
-	operation: "run" | "status" | "steer";
+	operation: "run" | "status" | "steer" | "host";
 	key: string;
 	state: "started" | "completed" | "failed" | "detached" | "stopped" | "reused" | "queued" | "delivered" | "missed";
 	/** Canonical child agent name when resolved launch or result data is available. */
@@ -938,6 +971,8 @@ export interface WorkflowScriptTraceEntry {
 	phase?: string;
 	label?: string;
 	error?: string;
+	/** Internal provenance for a generated runs.lanes child key. */
+	generatedLaneKey?: string;
 	lane?: import("../shared/types.ts").WorkflowLaneMetadata;
 	warning?: string;
 }
@@ -1001,6 +1036,8 @@ export interface RunWorkflowScriptOptions {
 	resolveResume?: (reference: WorkflowReceiptResumeReference, signal: AbortSignal) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
 	steer?: (key: string, message: string, options: WorkflowSteerOptions, signal: AbortSignal) => Promise<WorkflowSteerResult>;
+	host?: (key: string, params: WorkflowHostCommandParams, signal: AbortSignal) => Promise<WorkflowHostCommandResult>;
+	onHostStep?: (hostStep: HostStepNodeV1) => void;
 	state?: {
 		get: (key: string) => unknown | Promise<unknown>;
 		set: (key: string, value: unknown) => void | Promise<void>;
@@ -1172,10 +1209,45 @@ function literalString(node: unknown): string | undefined {
 	return undefined;
 }
 
-function directRunsCall(node: unknown, method: "run" | "all"): node is AstNode {
+function directRunsCall(node: unknown, method: "run" | "all" | "host"): node is AstNode {
 	if (!astNode(node) || node.type !== "CallExpression" || !astNode(node.callee) || node.callee.type !== "MemberExpression") return false;
 	const property = node.callee.computed === true ? literalString(node.callee.property) : astNode(node.callee.property) && node.callee.property.type === "Identifier" ? node.callee.property.name : undefined;
 	return property === method && astNode(node.callee.object) && node.callee.object.type === "Identifier" && node.callee.object.name === "runs";
+}
+
+function validateStaticHostCall(call: AstNode): WorkflowScriptValidationError[] {
+	const args = Array.isArray(call.arguments) ? call.arguments : [];
+	const keyNode = astNode(args[0]) ? args[0] : undefined;
+	const params = astNode(args[1]) ? args[1] : undefined;
+	const errors: WorkflowScriptValidationError[] = [];
+	const key = literalString(keyNode);
+	if (keyNode && key !== undefined && !KEY_PATTERN.test(key)) errors.push({ message: "runs.host key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", ...nodeLocation(keyNode) });
+	if (!params || params.type !== "ObjectExpression" || !Array.isArray(params.properties) || params.properties.some((property) => !astNode(property) || property.type !== "Property")) return errors;
+	const allowed = new Set(["kind", "command", "timeoutMs", "output", "role", "provider"]);
+	for (const property of params.properties) {
+		if (!astNode(property)) continue;
+		const name = staticPropertyKey(property);
+		if (name !== undefined && !allowed.has(name)) errors.push({ message: `runs.host params contain unsupported field '${name}'.`, ...nodeLocation(property) });
+	}
+	const kindNode = directObjectPropertyValue(params, "kind");
+	const commandNode = directObjectPropertyValue(params, "command");
+	const timeoutNode = directObjectPropertyValue(params, "timeoutMs");
+	const kind = literalString(kindNode);
+	const command = literalString(commandNode);
+	const timeout = astNode(timeoutNode) && timeoutNode.type === "Literal" ? timeoutNode.value : undefined;
+	if (!kindNode) errors.push({ message: "runs.host params require kind: 'command'.", ...nodeLocation(params) });
+	else if (kind !== undefined && kind !== "command") errors.push({ message: "runs.host params kind must be 'command'.", ...nodeLocation(kindNode) });
+	if (!commandNode) errors.push({ message: "runs.host params require command.", ...nodeLocation(params) });
+	else if (command !== undefined && !command.trim()) errors.push({ message: "runs.host params command must be non-empty.", ...nodeLocation(commandNode) });
+	if (!timeoutNode) errors.push({ message: "runs.host params require timeoutMs.", ...nodeLocation(params) });
+	else if (typeof timeout === "number" && (!Number.isInteger(timeout) || timeout < 1)) errors.push({ message: "runs.host params timeoutMs must be a positive integer.", ...nodeLocation(timeoutNode) });
+	const outputNode = directObjectPropertyValue(params, "output");
+	const output = literalString(outputNode);
+	if (outputNode && output !== undefined && (!output.trim() || /^[/\\]|(?:^|[/\\])\.\.(?:[/\\]|$)/.test(output))) errors.push({ message: "runs.host params output must be a non-empty relative path without traversal.", ...nodeLocation(outputNode) });
+	const roleNode = directObjectPropertyValue(params, "role");
+	const role = literalString(roleNode);
+	if (roleNode && role !== undefined && role !== "ci" && role !== "gate") errors.push({ message: "runs.host params role must be 'ci' or 'gate'.", ...nodeLocation(roleNode) });
+	return errors;
 }
 
 function nodeLocation(node: AstNode): Pick<WorkflowScriptValidationError, "line" | "column"> {
@@ -1298,6 +1370,7 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 				}
 			}
 		}
+		if (directRunsCall(node, "host")) errors.push(...validateStaticHostCall(node));
 		const boundaryValue = node.type === "CallExpression" && astNode(node.callee) && node.callee.type === "Identifier" && node.callee.name === "emit" && Array.isArray(node.arguments) && astNode(node.arguments[0])
 			? node.arguments[0]
 			: node.type === "CallExpression" && astNode(node.callee) && node.callee.type === "MemberExpression" && astNode(node.callee.object) && node.callee.object.type === "Identifier" && node.callee.object.name === "state" && astNode(node.callee.property) && node.callee.property.type === "Identifier" && node.callee.property.name === "set" && Array.isArray(node.arguments) && astNode(node.arguments[1])
@@ -1422,13 +1495,15 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const trace: WorkflowScriptTraceEntry[] = [];
 	const children = new Map<string, WorkflowScriptChildResult>();
 	const childOrder: string[] = [];
-	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean }>();
+	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string }>();
 	const steers = new Map<number, { key: string; promise: Promise<WorkflowSteerResult>; observed: boolean }>();
+	const hostCalls = new Map<number, { key: string; promise: Promise<WorkflowHostCommandResult>; observed: boolean }>();
 	const stoppedLaunches = new Set<string>();
 	const childStopControllers = new Map<string, AbortController>();
 	const batchAdmissions = new Map<string, Promise<void>>();
 	const observedRunCalls = new Set<number>();
 	const observedSteerCalls = new Set<number>();
+	const observedHostCalls = new Set<number>();
 	const childController = new AbortController();
 	let settled = false;
 	let finishing = false;
@@ -1449,6 +1524,13 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			console.error("Workflow onTrace callback failed:", error);
 		}
 	};
+	const hostStepChanged = (hostStep: HostStepNodeV1) => {
+		try {
+			options.onHostStep?.(hostStep);
+		} catch (error) {
+			console.error("Workflow onHostStep callback failed:", error);
+		}
+	};
 	const stoppedChildResult = (key: string, message: string): WorkflowScriptChildResult => ({ key, ok: false, stopped: true, output: message, error: message, artifactPaths: [] });
 	const responseBoundaryFailure = (key: string, error: unknown): WorkflowScriptChildResult => {
 		const text = error instanceof Error ? error.message : String(error);
@@ -1467,6 +1549,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			...(started?.agent ? { agent: started.agent } : {}),
 			...(started?.phase ? { phase: started.phase } : {}),
 			...(started?.label ? { label: started.label } : {}),
+			...(started?.generatedLaneKey ? { generatedLaneKey: started.generatedLaneKey } : {}),
 			error: message,
 		});
 		traceChanged();
@@ -1479,7 +1562,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (settled || finishing) return;
 			finishing = true;
 			childController.abort("error" in outcome ? outcome.error : new Error("Workflow script completed."));
-			void Promise.allSettled([...steers.values()].map(({ promise }) => promise)).then(() => {
+			void Promise.allSettled([...steers.values(), ...hostCalls.values()].map(({ promise }) => promise)).then(() => {
 				if (settled) return;
 				settled = true;
 				options.registerStopChild?.(undefined);
@@ -1492,7 +1575,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					: "value" in outcome
 						? (() => {
 							const unobservedSteers = [...steers.values()].filter((steer) => !steer.observed).map((steer) => steer.key);
-							return unobservedSteers.length > 0 ? new Error(`workflowScript completed with unawaited runs.steer call(s): ${unobservedSteers.map((key) => `'${key}'`).join(", ")}. Await or return each call.`) : undefined;
+							if (unobservedSteers.length > 0) return new Error(`workflowScript completed with unawaited runs.steer call(s): ${unobservedSteers.map((key) => `'${key}'`).join(", ")}. Await or return each call.`);
+							const unobservedHosts = [...hostCalls.values()].filter((host) => !host.observed).map((host) => host.key);
+							return unobservedHosts.length > 0 ? new Error(`workflowScript completed with unawaited runs.host call(s): ${unobservedHosts.map((key) => `'${key}'`).join(", ")}. Await or return each call.`) : undefined;
 						})()
 						: undefined;
 				if ("error" in outcome) reject(new WorkflowScriptError(outcome.error.message, partial(), outcome.error.workflowErrorKind === "detached-child" || outcome.error.workflowErrorKind === "timeout" ? outcome.error.workflowErrorKind : undefined));
@@ -1518,6 +1603,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					...(started?.agent ? { agent: started.agent } : {}),
 					...(started?.phase ? { phase: started.phase } : {}),
 					...(started?.label ? { label: started.label } : {}),
+					...(started?.generatedLaneKey ? { generatedLaneKey: started.generatedLaneKey } : {}),
 					error: error.message,
 				});
 			}
@@ -1586,6 +1672,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					const steer = steers.get(message.callId);
 					if (steer) steer.observed = true;
 					else observedSteerCalls.add(message.callId);
+				} else if (message.operation === "host") {
+					const host = hostCalls.get(message.callId);
+					if (host) host.observed = true;
+					else observedHostCalls.add(message.callId);
 				}
 				return;
 			}
@@ -1679,6 +1769,52 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				respond(promise);
 				return;
 			}
+			if (message.method === "host") {
+				let key: string;
+				let params: WorkflowHostCommandParams;
+				try {
+					key = validateKey(message.args.key, "runs.host");
+					params = normalizeWorkflowHostCommandParams(message.args.params, `runs.host('${key}') params`);
+				} catch (error) {
+					return respond(Promise.reject(error));
+				}
+				if (!options.host) return respond(Promise.reject(new Error("runs.host is unavailable in this host context.")));
+				if (hostCalls.size >= HOST_STEP_MAX_COUNT) return respond(Promise.reject(new Error(`workflowScript supports at most ${HOST_STEP_MAX_COUNT} runs.host calls.`)));
+				const startedAt = Date.now();
+				const startedStep: HostStepNodeV1 = {
+					version: 1,
+					kind: "host-step",
+					monitorKind: "command",
+					id: key,
+					label: key,
+					...(params.role ? { role: params.role } : {}),
+					...(params.provider ? { provider: params.provider } : {}),
+					state: "running",
+					updatedAt: startedAt,
+					deadlineAt: startedAt + params.timeoutMs,
+				};
+				hostStepChanged(startedStep);
+				trace.push({ operation: "host", key, state: "started" });
+				traceChanged();
+				const promise = Promise.resolve().then(() => options.host!(key, params, childController.signal)).then((result) => {
+					const state = result.state === "stopped" ? "cancelled" : result.ok ? "done" : "error";
+					const detail = [result.error, result.stderr.trim() || result.stdout.trim()].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 200);
+					hostStepChanged({ ...startedStep, state, ...(state === "done" ? { verdict: "pass" as const } : {}), ...(!result.ok ? { reasonCode: result.state === "timed-out" ? "timed_out" : result.state === "stopped" ? "aborted" : "command_failed" } : {}), ...(detail ? { detail } : {}), reportPath: params.output ?? result.outputPath.split(/[\\/]/).at(-1), exitCode: result.exitCode, updatedAt: Date.now() });
+					trace.push({ operation: "host", key, state: result.ok ? "completed" : result.state === "stopped" ? "stopped" : "failed", durationMs: result.durationMs, ...(!result.ok ? { error: result.error ?? "Host command failed." } : {}) });
+					traceChanged();
+					if (!result.ok) throw new Error(`Host command '${key}' failed: ${detail || result.error || `exit code ${result.exitCode ?? "unknown"}`}`);
+					return result;
+				}, (error: unknown) => {
+					const text = error instanceof Error ? error.message : String(error);
+					hostStepChanged({ ...startedStep, state: "error", reasonCode: "execution_failed", detail: text.replace(/\s+/g, " ").slice(0, 200), updatedAt: Date.now() });
+					trace.push({ operation: "host", key, state: "failed", durationMs: Date.now() - startedAt, error: text });
+					traceChanged();
+					throw error;
+				});
+				hostCalls.set(message.callId, { key, promise, observed: observedHostCalls.delete(message.callId) });
+				respond(promise, `runs.host('${key}') result`);
+				return;
+			}
 			if (message.method !== "run") return respond(Promise.reject(new Error(`Unknown runs API method '${message.method}'.`)));
 
 			let key: string;
@@ -1689,6 +1825,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			}
 			const params = message.args.params;
 			if (!isRecord(params)) return respond(Promise.reject(new Error(`runs.run('${key}', params) requires a params object.`)));
+			const generatedLaneKey = typeof message.args.generatedLaneKey === "string" && KEY_PATTERN.test(message.args.generatedLaneKey) && key.startsWith(`${message.args.generatedLaneKey}.`)
+				? message.args.generatedLaneKey
+				: undefined;
 			const collectFailure = message.args.collectFailure === true;
 			const callObserved = observedRunCalls.delete(message.callId);
 			const deliver = (promise: Promise<WorkflowScriptChildResult>) => collectFailure
@@ -1706,7 +1845,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (existing) {
 				if (existing.fingerprint !== fingerprint) return respond(Promise.reject(new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`)));
 				if (callObserved) existing.observed = true;
-				trace.push({ operation: "run", key, state: "reused", ...workflowStringMetadata(params) });
+				trace.push({ operation: "run", key, state: "reused", ...workflowStringMetadata(params), ...(existing.generatedLaneKey ? { generatedLaneKey: existing.generatedLaneKey } : {}) });
 				traceChanged();
 				return respond(deliver(existing.promise), `runs.run('${key}') result`, (error) => children.set(key, responseBoundaryFailure(key, error)));
 			}
@@ -1804,7 +1943,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					const autoResumeParams = setupAbortResumeParams(params, result, childSignal);
 					if (!autoResumeParams) return result;
 					resolvedResumeLineage = [...new Set([...(resolvedResumeLineage ?? []), result.runId!])];
-					trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(autoResumeParams), phase: "auto-resume", runId: result.runId });
+					trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(autoResumeParams), ...(generatedLaneKey ? { generatedLaneKey } : {}), phase: "auto-resume", runId: result.runId });
 					traceChanged();
 					return options.launch(key, autoResumeParams, childSignal, { admitted: true, batch: batch !== undefined });
 				} finally {
@@ -1819,7 +1958,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				if (stoppedLaunches.has(key)) return children.get(key) ?? normalized;
 				children.set(key, normalized);
 				const state = normalized.ok ? "completed" : normalized.stopped ? "stopped" : normalized.detached ? "detached" : "failed";
-				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(!normalized.ok ? { error: normalized.error ?? normalized.output } : {}) });
+				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(!normalized.ok ? { error: normalized.error ?? normalized.output } : {}) });
 				traceChanged();
 				return normalized;
 			}, (error: unknown) => {
@@ -1828,13 +1967,13 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				childStopControllers.delete(key);
 				if (stoppedLaunches.has(key)) return children.get(key) ?? { ...failure, stopped: true };
 				children.set(key, failure);
-				trace.push({ operation: "run", key, state: "failed", durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), error: text });
+				trace.push({ operation: "run", key, state: "failed", durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), error: text });
 				traceChanged();
 				return failure;
 			});
-			launches.set(key, { fingerprint, promise, observed: callObserved });
+			launches.set(key, { fingerprint, promise, observed: callObserved, ...(generatedLaneKey ? { generatedLaneKey } : {}) });
 			childOrder.push(key);
-			trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(params) });
+			trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}) });
 			traceChanged();
 			respond(deliver(promise), `runs.run('${key}') result`, (error) => children.set(key, responseBoundaryFailure(key, error)));
 		});

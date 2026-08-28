@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Add bounded `runs.host(...)` command steps to `workflowScript`, with required timeouts, saved output, and host-step status/receipt evidence (#1648).
 - Add bounded, provider-agnostic host-owned CI and gate workflow rows with explicit monitor kinds, terminal verdicts, stale freshness, report pointers, and fail-closed status/receipt projection.
 - Persist bounded workflow lane metadata across child status, terminal receipts, and existing worktree handoff manifests, including display-only worktree paths and branches without adding a lane registry or cleanup authority; write pending worktree ownership evidence before creation to avoid crash orphan gaps.
 - Add `runs.lanes(...)` for bounded parallel sequential workflow stages with per-lane results and retained-resume support (#1633).
@@ -14,6 +15,8 @@
 - Accept a child id on `/subagents-stop <run-id> <child-id>` so RPC hosts and non-TUI sessions can stop one child of a multi-child async run or workflow without stopping the whole run. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1603.
 
 ### Changed
+- Reduce internal verbosity in launch, status, output, settings, and worktree cleanup paths without changing behavior.
+- Include a direct resumable child id in missing workflow receipt guidance when retained status proves it is safe.
 - Clarify `workflowScript` contracts: each distinct retained resume pass needs a new stable workflow key, and durable child output paths should use explicit bindings plus returned path metadata.
 - Record attested merge or supersession evidence in existing worktree handoff manifests and render fail-closed cleanup eligibility without performing removal.
 - Show optional lane/work-item context in async status rows, including known phase, gate, next action, output, run reference, and stale/blocked signals without adding render-time I/O.
@@ -26,6 +29,14 @@
 - Show workflow child labels and phases in async status progress while preserving stable workflow keys.
 
 ### Fixed
+- Ignore stale cached UI contexts during background status refresh and session lifecycle cleanup (#1670).
+- Compact workflow preflight status in default TUI/status views while keeping full details available when expanded (#1668).
+- Give `runs.lanes(...)` stage-0 retained-resume validation actionable `runs.run(...)` guidance instead of a generic error (#1657).
+- Remove the remaining `lane:` prefix from operator-facing async status rows in the TUI (#1658).
+- Allow scheduled project roots shared through a registered Git worktree's `.pi` symlink while rejecting unrelated or unproven Git-layout escapes. Thanks to [@sususu98](https://github.com/sususu98) for #1656.
+- Include delegated child usage in subagent tool results and `/subagent-cost`, including completed async workflow children and parent compaction usage with persisted workflow-receipt recovery when needed (#1662, #1666). Thanks to [@Geraldo-Morais](https://github.com/Geraldo-Morais) for #1662 and [@jf88888](https://github.com/jf88888) for #1666.
+- Avoid false preflight mismatch warnings for generated `runs.lanes(...)` stage keys (#1649).
+- Accept long host tool-call ids in workflow child summaries, matching the existing 4,096-byte session id bound. Thanks to [@SudoKillMe](https://github.com/SudoKillMe) for #1653.
 - Keep an async `workflowScript` continuation live while an awaited child coordinates with its supervisor, so sequential tail steps continue after the child settles (#1634).
 - Stop stale extension and slash-command contexts from escaping during reload or session replacement.
 - Include saved workflow child output paths and bounded inline previews in completion notices (#1629).
@@ -45,7 +56,6 @@
 - Prevent Fleet prompt audit rendering from crashing on malformed non-string task payloads. Thanks to [@bengidev](https://github.com/bengidev) for #1586.
 - Resume a retained child session once after a provider or transport abort follows useful progress, without restarting the task or involving the parent model.
 
-### Fixed
 - Retry unused fallback models after a provider reports a plain-text `500` or `internal server error`. Thanks to [@rafafortes](https://github.com/rafafortes) for #1642.
 - Mark missing required child handoffs with useful mutation evidence as partial needs-attention results.
 

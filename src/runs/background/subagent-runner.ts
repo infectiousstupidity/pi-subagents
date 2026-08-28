@@ -46,7 +46,6 @@ import {
 	type TurnBudgetState,
 	type Usage,
 	type WorkflowGraphSnapshot,
-	type SteeringStatus,
 	type SteeringTargetState,
 	type SteeringTargetStatus,
 	type SubagentChildStatusEvent,
@@ -54,7 +53,6 @@ import {
 	DEFAULT_MAX_OUTPUT,
 	type MaxOutputConfig,
 	SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
-	POLL_INTERVAL_MS,
 	truncateOutput,
 	getSubagentDepthEnv,
 } from "../../shared/types.ts";
@@ -432,6 +430,23 @@ function costSummaryFromAttempts(attempts: ModelAttempt[] | undefined): CostSumm
 	}
 	return inputTokens > 0 || outputTokens > 0 || costUsd > 0
 		? { inputTokens, outputTokens, costUsd }
+		: undefined;
+}
+
+function usageFromAttempts(attempts: ModelAttempt[] | undefined): Usage | undefined {
+	if (!attempts || attempts.length === 0) return undefined;
+	const usage = emptyUsage();
+	for (const attempt of attempts) {
+		if (!attempt.usage) continue;
+		usage.input += attempt.usage.input;
+		usage.output += attempt.usage.output;
+		usage.cacheRead += attempt.usage.cacheRead;
+		usage.cacheWrite += attempt.usage.cacheWrite;
+		usage.cost += attempt.usage.cost;
+		usage.turns += attempt.usage.turns;
+	}
+	return usage.input !== 0 || usage.output !== 0 || usage.cacheRead !== 0 || usage.cacheWrite !== 0 || usage.cost !== 0 || usage.turns !== 0
+		? usage
 		: undefined;
 }
 
@@ -1381,6 +1396,7 @@ async function runSingleStepInner(
 				modelAttempts: imported.modelAttempts,
 				contextOverflow: imported.contextOverflow,
 				totalCost: imported.totalCost,
+				usage: imported.usage,
 				structuredOutput: timedOut || stopped ? undefined : imported.structuredOutput,
 				structuredOutputPath: timedOut || stopped ? undefined : imported.structuredOutputPath,
 				structuredOutputSchemaPath: timedOut || stopped ? undefined : imported.structuredOutputSchemaPath,
@@ -1510,14 +1526,18 @@ async function runSingleStepInner(
 		}));
 		try { fs.writeFileSync(ctx.outputFile, external.output, "utf-8"); } catch { /* Observability output is best-effort. */ }
 		const resolvedOutput = step.outputPath && external.exitCode === 0
-			? resolveSingleOutput(step.outputPath, external.output, outputSnapshot)
+			? resolveSingleOutput(step.outputPath, external.output, outputSnapshot, step.outputClaimPath)
 			: { fullOutput: external.output };
 		const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, resolvedOutput.fullOutput) : undefined;
+		const exitCode = resolvedOutput.fatalError ? 1 : external.exitCode;
+		const error = resolvedOutput.fatalError && resolvedOutput.saveError
+			? external.error ? `${external.error}\n${resolvedOutput.saveError}` : resolvedOutput.saveError
+			: external.error;
 		const finalizedOutput = finalizeSingleOutput(omitUndefinedProperties({
 			fullOutput: resolvedOutput.fullOutput,
 			outputPath: step.outputPath,
 			outputMode: step.outputMode,
-			exitCode: external.exitCode ?? 1,
+			exitCode: exitCode ?? 1,
 			savedPath: resolvedOutput.savedPath,
 			outputReference,
 			saveError: resolvedOutput.saveError,
@@ -1536,13 +1556,13 @@ async function runSingleStepInner(
 			context: step.context,
 			output: finalizedOutput.displayOutput,
 			outputState: external.output.trim() ? "present" : "absent",
-			exitCode: external.exitCode,
-			error: external.error,
+			exitCode,
+			error,
 			timedOut: external.timedOut,
 			stopped: external.stopped,
 			processSignal: external.processSignal,
 			artifactPaths,
-			outputSaveError: artifactErrors.outputSaveError,
+			outputSaveError: [resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined,
 			metadataSaveError: artifactErrors.metadataSaveError,
 			runner,
 			externalProcess: external.externalProcess,
@@ -1576,14 +1596,18 @@ async function runSingleStepInner(
 		}));
 		try { fs.writeFileSync(ctx.outputFile, external.output, "utf-8"); } catch { /* Observability output is best-effort. */ }
 		const resolvedOutput = step.outputPath && external.exitCode === 0
-			? resolveSingleOutput(step.outputPath, external.output, outputSnapshot)
+			? resolveSingleOutput(step.outputPath, external.output, outputSnapshot, step.outputClaimPath)
 			: { fullOutput: external.output };
 		const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, resolvedOutput.fullOutput) : undefined;
+		const exitCode = resolvedOutput.fatalError ? 1 : external.exitCode;
+		const error = resolvedOutput.fatalError && resolvedOutput.saveError
+			? external.error ? `${external.error}\n${resolvedOutput.saveError}` : resolvedOutput.saveError
+			: external.error;
 		const finalizedOutput = finalizeSingleOutput(omitUndefinedProperties({
 			fullOutput: resolvedOutput.fullOutput,
 			outputPath: step.outputPath,
 			outputMode: step.outputMode,
-			exitCode: external.exitCode,
+			exitCode: exitCode ?? 1,
 			savedPath: resolvedOutput.savedPath,
 			outputReference,
 			saveError: resolvedOutput.saveError,
@@ -1602,12 +1626,12 @@ async function runSingleStepInner(
 			context: step.context,
 			output: finalizedOutput.displayOutput,
 			outputState: external.output.trim() ? "present" : "absent",
-			exitCode: external.exitCode,
-			error: external.error,
+			exitCode,
+			error,
 			timedOut: external.timedOut,
 			stopped: external.stopped,
 			artifactPaths,
-			outputSaveError: artifactErrors.outputSaveError,
+			outputSaveError: [resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined,
 			metadataSaveError: artifactErrors.metadataSaveError,
 			runner,
 			externalJob: external.externalJob,
@@ -2075,8 +2099,14 @@ async function runSingleStepInner(
 	const rawOutput = finalResult?.finalOutput ?? "";
 	const outputForPersistence = stripAcceptanceReport(rawOutput);
 	const resolvedOutput = step.outputPath && finalResult?.exitCode === 0
-		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot)
+		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot, step.outputClaimPath)
 		: { fullOutput: outputForPersistence };
+	if (resolvedOutput.fatalError) {
+		if (finalResult) {
+			finalResult.exitCode = 1;
+			finalResult.error = finalResult.error ? `${finalResult.error}\n${resolvedOutput.saveError}` : resolvedOutput.saveError;
+		}
+	}
 	const output = stripAcceptanceReport(resolvedOutput.fullOutput);
 	const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, output) : undefined;
 	let outputForSummary = output;
@@ -2165,6 +2195,7 @@ async function runSingleStepInner(
 		abortRecoveryDiagnostic: effectiveFinalExitCode !== 0 ? finalResult?.abortRecoveryDiagnostic : undefined,
 		requiredOutput: effectiveFinalExitCode !== 0 ? finalResult?.effects?.settlementDiagnostic?.requiredOutput : undefined,
 	});
+	const usage = usageFromAttempts(modelAttempts);
 
 	const artifactErrors = artifactPaths && ctx.artifactConfig?.enabled !== false
 		? persistStepArtifacts({
@@ -2184,6 +2215,7 @@ async function runSingleStepInner(
 				model: finalResult?.model,
 				attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 				modelAttempts,
+				usage,
 				error: effectiveFinalError,
 				acceptance: effectiveAcceptance,
 				...(capabilityAudit ? { capabilityCeiling: capabilityAudit.ceiling, capabilityAudit } : {}),
@@ -2216,8 +2248,9 @@ async function runSingleStepInner(
 		modelAttempts,
 		contextOverflow: contextOverflow || undefined,
 		totalCost: costSummaryFromAttempts(modelAttempts),
+		usage,
 		artifactPaths,
-		outputSaveError: artifactErrors.outputSaveError,
+		outputSaveError: [resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined,
 		metadataSaveError: artifactErrors.metadataSaveError,
 		transcriptPath: transcriptWriter ? artifactPaths?.transcriptPath : undefined,
 		transcriptError: transcriptWriter?.getError(),
@@ -2835,6 +2868,7 @@ async function runSubagent(
 	const writeRecoverableStatusResult = (): void => {
 		const state = statusResultState();
 		if (!state || finalResultCommitted || !config.sessionId) return;
+		if ((state as string) === "complete") return;
 		const now = statusPayload.endedAt ?? statusPayload.lastUpdate ?? Date.now();
 		const summary = statusResultSummary(state);
 		runPersistence.write(resultPath, omitUndefinedProperties({
@@ -2858,6 +2892,7 @@ async function runSubagent(
 				model: step.model,
 				attemptedModels: step.attemptedModels,
 				modelAttempts: step.modelAttempts,
+				usage: usageFromAttempts(step.modelAttempts),
 				contextOverflow: step.contextOverflow,
 			})),
 			exitCode: state === "complete" || state === "paused" ? 0 : 1,
@@ -4313,6 +4348,7 @@ async function runSubagent(
 					modelAttempts: pr.modelAttempts,
 					contextOverflow: pr.contextOverflow,
 					totalCost: pr.totalCost,
+					usage: pr.usage,
 					artifactPaths: pr.artifactPaths,
 					transcriptPath: pr.transcriptPath,
 					transcriptError: pr.transcriptError,
@@ -4763,6 +4799,7 @@ async function runSubagent(
 						modelAttempts: pr.modelAttempts,
 						contextOverflow: pr.contextOverflow,
 						totalCost: pr.totalCost,
+						usage: pr.usage,
 						artifactPaths: pr.artifactPaths,
 						transcriptPath: pr.transcriptPath,
 						transcriptError: pr.transcriptError,
@@ -5017,6 +5054,7 @@ async function runSubagent(
 				modelAttempts: singleResult.modelAttempts,
 				contextOverflow: singleResult.contextOverflow,
 				totalCost: singleResult.totalCost,
+				usage: singleResult.usage,
 				artifactPaths: singleResult.artifactPaths,
 				transcriptPath: singleResult.transcriptPath,
 				transcriptError: singleResult.transcriptError,
@@ -5389,6 +5427,7 @@ async function runSubagent(
 				modelAttempts: r.modelAttempts,
 				contextOverflow: r.contextOverflow,
 				totalCost: r.totalCost,
+				usage: r.usage,
 				artifactPaths: r.artifactPaths,
 				outputSaveError: r.outputSaveError,
 				metadataSaveError: r.metadataSaveError,

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
-import { resultFilePath } from "./result-files.ts";
-import type { AcceptanceLedger, ArtifactPaths, AsyncStatus, CostSummary, EffectsProjection, ExecutionProjection, ModelAttempt } from "../../shared/types.ts";
+import * as path from "node:path";
+import { resultFilePath, resultPayloadPathForSessionRun } from "./result-files.ts";
+import type { AcceptanceLedger, ArtifactPaths, AsyncStatus, CostSummary, EffectsProjection, ExecutionProjection, ModelAttempt, Usage } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 
 export interface ImportedAsyncRoot {
@@ -25,6 +26,7 @@ export interface ImportedAsyncRootResult {
 	modelAttempts?: ModelAttempt[];
 	contextOverflow?: boolean;
 	totalCost?: CostSummary;
+	usage?: Usage;
 	structuredOutput?: unknown;
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
@@ -63,6 +65,7 @@ interface AsyncResultFile {
 		modelAttempts?: ModelAttempt[];
 		contextOverflow?: boolean;
 		totalCost?: CostSummary;
+		usage?: Usage;
 		structuredOutput?: unknown;
 		structuredOutputPath?: string;
 		structuredOutputSchemaPath?: string;
@@ -77,6 +80,23 @@ interface AsyncResultFile {
 const TERMINAL_STATES = new Set(["complete", "failed", "partial", "paused", "stopped"]);
 const TERMINAL_STEP_STATUSES = new Set(["complete", "completed", "failed", "partial", "paused", "stopped"]);
 
+function usageFromAttempts(attempts: ModelAttempt[] | undefined): Usage | undefined {
+	if (!attempts?.length) return undefined;
+	const usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+	for (const attempt of attempts) {
+		if (!attempt.usage) continue;
+		usage.input += attempt.usage.input;
+		usage.output += attempt.usage.output;
+		usage.cacheRead += attempt.usage.cacheRead;
+		usage.cacheWrite += attempt.usage.cacheWrite;
+		usage.cost += attempt.usage.cost;
+		usage.turns += attempt.usage.turns;
+	}
+	return usage.input !== 0 || usage.output !== 0 || usage.cacheRead !== 0 || usage.cacheWrite !== 0 || usage.cost !== 0 || usage.turns !== 0
+		? usage
+		: undefined;
+}
+
 function readResultFile(resultPath: string): AsyncResultFile | undefined {
 	try {
 		return JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultFile;
@@ -86,6 +106,13 @@ function readResultFile(resultPath: string): AsyncResultFile | undefined {
 		}
 		throw error;
 	}
+}
+
+function readImportedResultFile(root: ImportedAsyncRoot, status: AsyncStatus | null): AsyncResultFile | undefined {
+	const direct = readResultFile(root.resultPath);
+	if (direct || !status?.sessionId) return direct;
+	const indexedPath = resultPayloadPathForSessionRun(path.dirname(root.resultPath), status.sessionId, root.runId);
+	return indexedPath ? readResultFile(indexedPath) : undefined;
 }
 
 function selectedStatusStep(status: AsyncStatus | null, index: number): NonNullable<AsyncStatus["steps"]>[number] | undefined {
@@ -119,6 +146,7 @@ function outputFromTerminalStatus(root: ImportedAsyncRoot, status: AsyncStatus, 
 	const execution = step?.execution ?? (partialStatus
 		? { status: "partial" as const, success: false, exitCode: 1, error: message }
 		: undefined);
+	const usage = usageFromAttempts(step?.modelAttempts);
 	return {
 		agent,
 		output: message,
@@ -134,6 +162,7 @@ function outputFromTerminalStatus(root: ImportedAsyncRoot, status: AsyncStatus, 
 		...(step?.modelAttempts ? { modelAttempts: step.modelAttempts } : {}),
 		...(step?.contextOverflow ? { contextOverflow: true } : {}),
 		...(step?.totalCost ? { totalCost: step.totalCost } : {}),
+		...(usage ? { usage } : {}),
 		...(step?.structuredOutput !== undefined ? { structuredOutput: step.structuredOutput } : {}),
 		...(step?.structuredOutputPath ? { structuredOutputPath: step.structuredOutputPath } : {}),
 		...(step?.structuredOutputSchemaPath ? { structuredOutputSchemaPath: step.structuredOutputSchemaPath } : {}),
@@ -146,6 +175,7 @@ function outputFromTerminalStatus(root: ImportedAsyncRoot, status: AsyncStatus, 
 
 function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, message: string): ImportedAsyncRootResult {
 	const step = selectedStatusStep(status, root.index);
+	const usage = usageFromAttempts(step?.modelAttempts);
 	return {
 		agent: step?.agent ?? status?.steps?.[root.index]?.agent ?? "subagent",
 		output: message,
@@ -160,6 +190,7 @@ function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, 
 		...(step?.modelAttempts ? { modelAttempts: step.modelAttempts } : {}),
 		...(step?.contextOverflow ? { contextOverflow: true } : {}),
 		...(step?.totalCost ? { totalCost: step.totalCost } : {}),
+		...(usage ? { usage } : {}),
 		...(step?.transcriptPath ? { transcriptPath: step.transcriptPath } : {}),
 	};
 }
@@ -175,6 +206,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 	const success = state === "complete" && !timedOut && !stopped;
 	const error = child?.error ?? (success ? undefined : stopped ? "Subagent stopped by user." : result.error ?? result.summary ?? status?.error ?? `Attached async root ${root.runId} did not complete successfully.`);
 	const execution = state ? { status: state === "complete" ? "completed" as const : state, success, exitCode: success ? 0 : 1, ...(error ? { error } : {}) } : undefined;
+	const usage = child?.usage ?? usageFromAttempts(step?.modelAttempts);
 	return {
 		agent,
 		output: success ? output : (output || error || ""),
@@ -191,6 +223,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 		...(child?.modelAttempts ?? step?.modelAttempts ? { modelAttempts: child?.modelAttempts ?? step?.modelAttempts } : {}),
 		...(child?.contextOverflow || step?.contextOverflow ? { contextOverflow: true } : {}),
 		...(child?.totalCost ?? step?.totalCost ? { totalCost: child?.totalCost ?? step?.totalCost } : {}),
+		...(usage ? { usage } : {}),
 		...(child?.structuredOutput !== undefined ? { structuredOutput: child.structuredOutput } : step?.structuredOutput !== undefined ? { structuredOutput: step.structuredOutput } : {}),
 		...(child?.structuredOutputPath ?? step?.structuredOutputPath ? { structuredOutputPath: child?.structuredOutputPath ?? step?.structuredOutputPath } : {}),
 		...(child?.structuredOutputSchemaPath ?? step?.structuredOutputSchemaPath ? { structuredOutputSchemaPath: child?.structuredOutputSchemaPath ?? step?.structuredOutputSchemaPath } : {}),
@@ -215,7 +248,7 @@ export async function waitForImportedAsyncRoot(
 	for (;;) {
 		const status = readStatus(root.asyncDir);
 		if (options.shouldAbort?.()) return outputFromTimeout(root, status, options.timeoutMessage ?? "Subagent timed out.");
-		const result = readResultFile(root.resultPath);
+		const result = readImportedResultFile(root, status);
 		if (result) return buildImportedResult(root, status, result);
 		if (isTerminalStatus(status, root.index)) {
 			terminalSince ??= now();

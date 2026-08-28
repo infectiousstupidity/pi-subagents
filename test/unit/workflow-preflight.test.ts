@@ -8,7 +8,9 @@ import {
 	WORKFLOW_PREFLIGHT_MAX_WARNINGS,
 	annotateWorkflowPreflightTrace,
 	formatWorkflowPreflight,
+	formatWorkflowPreflightPlanSummary,
 	formatWorkflowPreflightSummary,
+	formatWorkflowPreflightWarningSummary,
 	normalizeWorkflowPreflight,
 	validateWorkflowPreflight,
 	workflowPreflightWarnings,
@@ -54,6 +56,8 @@ describe("workflow preflight metadata", () => {
 		assert.match(table, /key \| mode \| decision \| claims \| expected output \| independence/);
 		assert.match(table, /issue1624-writer \| mutation \| Implement bounded preflight/);
 		assert.match(formatWorkflowPreflightSummary(normalized), /preflight · complete · 1 lane: issue1624-writer/);
+		assert.equal(formatWorkflowPreflightPlanSummary(normalized), "Plan: 1 lane · Implement bounded preflight");
+		assert.equal(formatWorkflowPreflightWarningSummary(["one", "two"], { indent: "  ", hint: "expand for debug" }), "  Plan note: 2 preflight mismatches · expand for debug.");
 	});
 
 	it("rejects unsupported, malformed, duplicate, and over-bound metadata", () => {
@@ -115,5 +119,37 @@ describe("workflow preflight metadata", () => {
 		assert.deepEqual(workflowPreflightWarnings(manyLanes, [], { settled: false }), []);
 		assert.ok(workflowPreflightWarnings(manyLanes, [], { settled: true }).some((warning) => warning.includes("declared lane 'declared-0' was not launched")));
 		assert.ok(WORKFLOW_PREFLIGHT_MAX_CLAIMS > 0);
+	});
+
+	it("treats exact and direct dotted keys as declared lane stages by convention", () => {
+		const lanes = normalizeWorkflowPreflight({
+			version: 1,
+			coverage: "complete",
+			lanes: [{ key: "audit" }],
+		});
+		const generatedStageTrace = [
+			{ operation: "run", key: "audit.writer", generatedLaneKey: "audit", state: "completed" as const },
+			{ operation: "run", key: "audit.review", generatedLaneKey: "audit", state: "completed" as const },
+		];
+		assert.deepEqual(workflowPreflightWarnings(lanes, generatedStageTrace, { settled: true }), []);
+		assert.equal(annotateWorkflowPreflightTrace(generatedStageTrace, lanes).some((entry) => entry.warning), false);
+
+		// Direct runs.run keys intentionally use the same lane.stage convention without provenance.
+		const directStageTrace = [
+			{ operation: "run", key: "audit.shadow", state: "started" as const },
+			{ operation: "run", key: "audit-other.writer", state: "started" as const },
+		];
+		assert.deepEqual(workflowPreflightWarnings(lanes, directStageTrace), [
+			"Preflight advisory: workflow key 'audit-other.writer' launched without a declared lane.",
+		]);
+		assert.deepEqual(workflowPreflightWarnings(lanes, directStageTrace, { settled: true }), [
+			"Preflight advisory: workflow key 'audit-other.writer' launched without a declared lane.",
+		]);
+		const directAnnotated = annotateWorkflowPreflightTrace(directStageTrace, lanes);
+		assert.equal(directAnnotated[0]?.warning, undefined);
+		assert.match(directAnnotated[1]?.warning ?? "", /without a declared lane/);
+
+		const exactTrace = [{ operation: "run", key: "audit", state: "completed" as const }];
+		assert.deepEqual(workflowPreflightWarnings(lanes, exactTrace, { settled: true }), []);
 	});
 });

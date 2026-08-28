@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Message } from "@earendil-works/pi-ai";
+import type { Message, Usage as PiUsage } from "@earendil-works/pi-ai";
 import { previewDisplayText, sanitizeDisplayText, truncateDisplayText } from "./display-text.ts";
 import { formatToolCall } from "./formatters.ts";
 import type { AgentProgress, AsyncStatus, Details, DisplayItem, ErrorInfo, NestedRunSummary, SingleResult, ToolCallSummary, Usage } from "./types.ts";
@@ -207,53 +207,6 @@ export function readStatus(asyncDir: string): AsyncStatus | null {
 	return status;
 }
 
-const outputTailCache = new Map<string, { mtime: number; size: number; lines: string[] }>();
-
-/**
- * Get the last N lines from an output file (with mtime/size-based caching)
- */
-function getOutputTail(outputFile: string | undefined, maxLines: number = 3): string[] {
-	if (!outputFile) return [];
-	let fd: number | null = null;
-	try {
-		const stat = fs.statSync(outputFile);
-		if (stat.size === 0) return [];
-
-		const cached = outputTailCache.get(outputFile);
-		if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
-			return cached.lines;
-		}
-
-		const tailBytes = 4096;
-		const start = Math.max(0, stat.size - tailBytes);
-		fd = fs.openSync(outputFile, "r");
-		const buffer = Buffer.alloc(Math.min(tailBytes, stat.size));
-		fs.readSync(fd, buffer, 0, buffer.length, start);
-		const content = buffer.toString("utf-8");
-		const allLines = content.split("\n").filter((l) => l.trim());
-		const lines = allLines.slice(-maxLines).map((l) => l.slice(0, 120) + (l.length > 120 ? "..." : ""));
-
-		outputTailCache.set(outputFile, { mtime: stat.mtimeMs, size: stat.size, lines });
-		if (outputTailCache.size > 20) {
-			const firstKey = outputTailCache.keys().next().value;
-			if (firstKey) outputTailCache.delete(firstKey);
-		}
-
-		return lines;
-	} catch {
-		// Output tails are UI-only hints; unreadable or missing files should render as no tail.
-		return [];
-	} finally {
-		if (fd !== null) {
-			try {
-				fs.closeSync(fd);
-			} catch {
-				// Closing the best-effort tail file handle should not surface over the main status view.
-			}
-		}
-	}
-}
-
 export function getLastActivity(outputFile: string | undefined): string {
 	if (!outputFile) return "";
 	try {
@@ -282,13 +235,6 @@ export function findLatestSessionFile(sessionDir: string): string | null {
 		.sort((a, b) => b.mtime - a.mtime);
 	const latest = files[0];
 	return latest ? latest.path : null;
-}
-
-function writePrompt(agent: string, prompt: string): { dir: string; path: string } {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-	const p = path.join(dir, `${agent.replace(/[^\w.-]/g, "_")}.md`);
-	fs.writeFileSync(p, prompt, { mode: 0o600 });
-	return { dir, path: p };
 }
 
 export function getFinalOutput(messages: Message[]): string {
@@ -391,6 +337,17 @@ export function sumResultsUsage(results: SingleResult[]): Usage {
 		usage.turns += result.usage.turns;
 	}
 	return usage;
+}
+
+export function toAgentToolUsage(usage: Usage): PiUsage {
+	return {
+		input: usage.input,
+		output: usage.output,
+		cacheRead: usage.cacheRead,
+		cacheWrite: usage.cacheWrite,
+		totalTokens: usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: usage.cost },
+	};
 }
 
 function addNestedCost(total: NonNullable<Details["totalCost"]>, children: NestedRunSummary[] | undefined): void {

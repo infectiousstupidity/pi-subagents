@@ -91,8 +91,8 @@ function resetWidgetLayout(): void {
 }
 
 describe("subagent async widget rendering", () => {
-	it("renders stored workflow preflight lanes without discovering external state", () => {
-		const text = buildWidgetLines([{
+	it("renders compact workflow plan status by default and keeps details expanded", () => {
+		const job = {
 			asyncId: "workflow-preflight",
 			asyncDir: "/tmp/workflow-preflight",
 			status: "running",
@@ -102,11 +102,26 @@ describe("subagent async widget rendering", () => {
 				coverage: "partial",
 				lanes: [{ key: "review", mode: "review", claims: ["src/tui"], expectedOutput: "review.md" }],
 			},
-			workflow: { trace: [], emits: [], console: [] },
-		}], theme, 180).join("\n");
-		assert.match(text, /Preflight: v1 · partial · 1 lane/);
-		assert.match(text, /review \| review \|/);
-		assert.match(text, /expected output \| independence/);
+			workflow: {
+				trace: [],
+				emits: [],
+				console: [],
+				preflightWarnings: ["Preflight advisory: workflow key 'review.extra' launched without a declared lane."],
+			},
+		};
+		const compact = buildWidgetLines([job], theme, 180).join("\n");
+		assert.match(compact, /Plan: 1 lane · review/);
+		assert.match(compact, /Plan note: 1 preflight mismatch · expand for debug\./);
+		assert.doesNotMatch(compact, /key \| mode \| decision \| claims \| expected output \| independence/);
+		assert.doesNotMatch(compact, /review \| review \|/);
+		assert.doesNotMatch(compact, /Preflight advisory/);
+
+		const expanded = buildWidgetLines([job], theme, 180, true).join("\n");
+		assert.match(expanded, /Preflight: v1 · partial · 1 lane/);
+		assert.match(expanded, /review \| review \|/);
+		assert.match(expanded, /expected output \| independence/);
+		assert.match(expanded, /Preflight warnings:/);
+		assert.match(expanded, /review\.extra.*without a declared lane/);
 	});
 
 	it("projects known workflow metadata into a compact lane row", () => {
@@ -145,11 +160,12 @@ describe("subagent async widget rendering", () => {
 			chips: ["fresh"],
 		});
 		const text = buildWidgetLines([job], theme, 180).join("\n");
-		assert.match(text, /lane: Review #1610 — Inspect the current status surface · role:reviewer · running/);
+		assert.match(text, /Review #1610 — Inspect the current status surface · role:reviewer · running/);
 		assert.match(text, /phase:fresh-review · gate:review required · next:review output · out:review\.md · ref:review · \[fresh\]/);
-		assert.match(text, /lane: Fix candidate/);
-		assert.match(text, /lane: Fix candidate · role:writer · pending/);
+		assert.match(text, /Fix candidate/);
+		assert.match(text, /Fix candidate · role:writer · pending/);
 		assert.match(text, /phase:implementation · next:await launch · out:fix\.md/);
+		assert.doesNotMatch(text, /lane:/);
 	});
 
 	it("prefers bounded loaded workspace context over repeated internal lane refs", () => {
