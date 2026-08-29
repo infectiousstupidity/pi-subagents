@@ -12,14 +12,29 @@ description: |
 Parent owns orchestration. Children do not spawn subagents unless the parent
 explicitly delegated fanout and their resolved `tools` allow `subagent`.
 
+## Progressive tool surface
+
+The default `subagent` contract is intentionally small. Use direct `{ agent, task }`
+for one child and `calls[]` for ordinary independent fanout.
+
+Load uncommon controls only when needed:
+
+- `subagent_capability({ mode: "advanced" })` for `workflowScript`, management actions, missions, schedules, watchdogs, and other advanced controls.
+- `subagent_capability({ mode: "wait" })` for `subagent_wait`.
+- `subagent_capability({ mode: "all" })` when both are needed in the same parent turn.
+
+Do not unload capabilities manually. The minimal surface is restored automatically
+after the parent turn.
+
 ## Launch shape
 
 | Need | Use |
 | --- | --- |
 | One disposable child | direct `{ agent, task }` |
-| Sequence, fanout, retry, gate monitor, retained resume, cross-repo wave, or aggregate result | `workflowScript` |
+| Independent parallel children | compact `calls[]` |
+| Sequence, retry, gate monitor, retained resume, cross-repo wave, or aggregate result | load advanced, then `workflowScript` |
 | Council of advisors | `../council-mode/SKILL.md` |
-| Management, status, steering, authoring, or inspection | `action` |
+| Management, status, steering, authoring, or inspection | load advanced, then `action` |
 
 `workflowScript` is code-driven: `runs.run(...)` for keyed steps,
 `runs.all([...])` for fanout, plain JavaScript for branching and aggregation.
