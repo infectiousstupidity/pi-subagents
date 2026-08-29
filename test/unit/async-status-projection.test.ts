@@ -84,6 +84,7 @@ describe("async status projection", () => {
 			label: "Fresh review",
 			phase: "quality",
 			status: "partial",
+			context: "fresh",
 			activityState: "needs_attention",
 			startedAt: 10,
 			tokens: { input: 20, output: 5, total: 25, window: 18 },
@@ -92,6 +93,7 @@ describe("async status projection", () => {
 		assert.deepEqual(rows, [{
 			name: "quality: review · Fresh review (reviewer)",
 			state: "partial",
+			context: "fresh",
 			activity: "needs attention",
 			startedAt: 10,
 			tokens: 25,
@@ -114,6 +116,34 @@ describe("async status projection", () => {
 			{ name: "CI checks", kind: "ci", state: "done", provider: "github-ci", verdict: "pass" },
 			{ name: "Review gate", kind: "gate", state: "done", provider: "github-ci", verdict: "inconclusive", reasonCode: "stale-head", detail: "head changed", target: "PR #1614", freshness: { expectedRef: "old-head", observedRef: "new-head", stale: true }, reportPath: "gate.json" },
 		]);
+	});
+
+	it("projects done host steps without verdicts as partial", () => {
+		const snapshot = projectAsyncStatusSnapshot([job({
+			asyncId: "inconclusive-gate",
+			status: "running",
+			hostSteps: [hostStep({ verdict: undefined })],
+		})]);
+
+		assert.equal(snapshot.runs[0]?.children?.[0]?.state, "partial");
+	});
+
+	it("reserves bounded snapshot capacity for host steps", () => {
+		const snapshot = projectAsyncStatusSnapshot([job({
+			asyncId: "bounded-gate",
+			status: "running",
+			steps: [
+				{ agent: "first", status: "running" },
+				{ agent: "second", status: "running" },
+			],
+			hostSteps: [hostStep()],
+		})], { maxChildrenPerNode: 2 });
+
+		assert.deepEqual(snapshot.runs[0]?.children?.map(({ kind, id }) => ({ kind, id })), [
+			{ kind: "step", id: "step:0" },
+			{ kind: "host-step", id: "ci-check" },
+		]);
+		assert.equal(snapshot.omitted.children, 1);
 	});
 
 	it("omits malformed host nodes instead of rendering them as agents", () => {

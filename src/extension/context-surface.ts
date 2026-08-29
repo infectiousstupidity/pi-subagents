@@ -24,7 +24,12 @@ type BasicSubagentInput = {
 	timeoutMs?: number;
 };
 
-type CapabilityMode = "advanced" | "wait" | "all" | "minimal";
+type CapabilityMode = "advanced" | "wait" | "all";
+
+export interface ContextSurfaceController {
+	useProgressiveSurface(): void;
+	useUpstreamSurface(): void;
+}
 
 function buildParallelWorkflowScript(calls: Array<{ agent: string; task: string }>): string {
 	const items = calls.map((call, index) => ({
@@ -62,13 +67,9 @@ function validateBasicParams(params: BasicSubagentInput): string | undefined {
 
 /**
  * Progressive-disclosure wrapper for the parent-facing model tool surface.
- *
- * The full pi-subagents runtime still initializes exactly as before. During
- * registration we capture the large model-facing contracts and expose a small
- * contract for the common single-child and parallel-fanout paths. The original
- * full tool is restored on demand, so advanced behavior is not reimplemented.
+ * The original runtime remains intact; only the registered model contracts vary.
  */
-export default function registerContextOptimizedSubagentExtension(pi: ExtensionAPI): void {
+export default function registerContextOptimizedSubagentExtension(pi: ExtensionAPI): ContextSurfaceController {
 	let fullSubagentTool: ToolDefinition | undefined;
 	let basicSubagentTool: ToolDefinition | undefined;
 	let waitTool: ToolDefinition | undefined;
@@ -123,16 +124,12 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 
 		if (tool.name === SUBAGENT_WAIT_TOOL_NAME) {
 			waitTool = tool;
-			// Do not register this large contract until it is actually requested.
 			return;
 		}
 
 		originalRegisterTool(tool);
 	};
 
-	// Pi's ExtensionAPI is a mutable runtime object. Intercept registration only
-	// during the existing extension's synchronous setup, then restore it so the
-	// original runtime keeps the exact same `pi` identity and behavior.
 	mutablePi.registerTool = interceptedRegisterTool as typeof pi.registerTool;
 	try {
 		registerFullSubagentExtension(pi);
@@ -152,9 +149,19 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 		pi.setActiveTools([...active, name]);
 	};
 
-	const restoreMinimalSurface = (): void => {
+	const useProgressiveSurface = (): void => {
 		if (basicSubagentTool) originalRegisterTool(basicSubagentTool);
+		addActiveTool(SUBAGENT_TOOL_NAME);
+		addActiveTool(SUBAGENT_CAPABILITY_TOOL_NAME);
 		removeActiveTool(SUBAGENT_WAIT_TOOL_NAME);
+	};
+
+	const useUpstreamSurface = (): void => {
+		if (fullSubagentTool) originalRegisterTool(fullSubagentTool);
+		if (waitTool) originalRegisterTool(waitTool);
+		addActiveTool(SUBAGENT_TOOL_NAME);
+		if (waitTool) addActiveTool(SUBAGENT_WAIT_TOOL_NAME);
+		removeActiveTool(SUBAGENT_CAPABILITY_TOOL_NAME);
 	};
 
 	const capabilityTool: ToolDefinition<typeof SubagentCapabilityParams, { mode: CapabilityMode }> = {
@@ -164,14 +171,6 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 		promptSnippet: "Load advanced subagent controls only when the minimal subagent tool cannot express the task.",
 		parameters: SubagentCapabilityParams,
 		async execute(_id, params) {
-			if (params.mode === "minimal") {
-				restoreMinimalSurface();
-				return {
-					content: [{ type: "text", text: "Restored the minimal subagent surface." }],
-					details: { mode: params.mode },
-				};
-			}
-
 			if (params.mode === "advanced" || params.mode === "all") {
 				if (!fullSubagentTool) {
 					return {
@@ -207,8 +206,10 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 		},
 	};
 	pi.registerTool(capabilityTool);
+	useProgressiveSurface();
 
-	// Advanced schemas should never become a permanent tax on later requests.
-	pi.on("session_start", restoreMinimalSurface);
-	pi.on("agent_end", restoreMinimalSurface);
+	pi.on("session_start", useProgressiveSurface);
+	pi.on("agent_end", useProgressiveSurface);
+
+	return { useProgressiveSurface, useUpstreamSurface };
 }

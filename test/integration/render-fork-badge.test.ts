@@ -12,9 +12,10 @@ type RenderSubagentResult = (
 		content: Array<{ type: "text"; text: string }>;
 		isError?: boolean;
 		details?: {
-			mode: "single" | "parallel" | "chain" | "management";
+			mode: "single" | "parallel" | "chain" | "workflow" | "management";
 			context?: "fresh" | "fork" | "mixed";
 			results: unknown[];
+			workflowGraph?: unknown;
 		};
 	},
 	options: { expanded: boolean },
@@ -24,7 +25,7 @@ type RenderSubagentResult = (
 type RenderSubagentSummary = (
 	result: {
 		content: Array<{ type: "text"; text: string }>;
-		details?: { mode: "single" | "parallel" | "chain" | "management"; results: unknown[]; progress?: unknown[]; asyncId?: string };
+		details?: { mode: "single" | "parallel" | "chain" | "workflow" | "management"; results: unknown[]; progress?: unknown[]; asyncId?: string; workflowGraph?: unknown };
 	},
 	options: { isPartial?: boolean },
 	theme: RenderTheme,
@@ -77,6 +78,16 @@ function withTerminalWidth<T>(columns: number, fn: () => T): T {
 			value: original,
 			configurable: true,
 		});
+	}
+}
+
+function withMockedDateNow<T>(now: number, fn: () => T): T {
+	const original = Date.now;
+	Date.now = () => now;
+	try {
+		return fn();
+	} finally {
+		Date.now = original;
 	}
 }
 
@@ -434,8 +445,10 @@ describe("renderSubagentResult fork indicator", () => {
 				content: [{ type: "text" as const, text: testCase.name }],
 				details: { mode: "single" as const, results: [child] },
 			};
-			const compact = renderSubagentResult!(result, { expanded: false }, theme).render(120).join("\n");
-			const expanded = renderSubagentResult!(result, { expanded: true }, theme).render(120).join("\n");
+			const [compact, expanded] = withMockedDateNow(0, () => [
+				renderSubagentResult!(result, { expanded: false }, theme).render(120).join("\n"),
+				renderSubagentResult!(result, { expanded: true }, theme).render(120).join("\n"),
+			]);
 
 			assert.equal(firstGrapheme(compact), testCase.glyph, `${testCase.name} compact glyph`);
 			assert.equal(firstGrapheme(expanded), testCase.glyph, `${testCase.name} expanded glyph`);
@@ -574,6 +587,29 @@ describe("renderSubagentResult fork indicator", () => {
 			assert.match(summary, /· completed$/, mode);
 			assert.doesNotMatch(summary, /running/, mode);
 		}
+	});
+
+	it("renders an inconclusive host graph as partial", () => {
+		const result = {
+			content: [{ type: "text" as const, text: "inconclusive gate" }],
+			details: {
+				mode: "workflow" as const,
+				results: ["worker", "reviewer"].map((agent) => ({ agent, task: "gate", exitCode: 0, messages: [], usage: emptyUsage })),
+				workflowGraph: {
+					runId: "workflow-partial",
+					mode: "workflow" as const,
+					phases: [],
+					nodes: [{ id: "gate", kind: "host-step" as const, label: "Review gate", status: "partial" as const }],
+				},
+			},
+		};
+
+		const summary = renderSubagentSummary!(result, {}, theme).render(120).join("\n");
+		const compact = renderSubagentResult!(result, { expanded: false }, theme).render(120).join("\n");
+		const expanded = renderSubagentResult!(result, { expanded: true }, theme).render(120).join("\n");
+		assert.match(summary, /■ workflow · partial$/);
+		assert.equal(firstGrapheme(compact), "■");
+		assert.match(expanded, /■ workflow .*· partial$/m);
 	});
 
 	it("keeps all-failed async aggregate inline summaries terminal", () => {
@@ -857,7 +893,7 @@ describe("renderSubagentResult fork indicator", () => {
 		assert.doesNotMatch(text, /Agent 1\/1: reviewer · running/);
 	});
 
-	it("keeps running compact result output stable when progress is unchanged", async () => {
+	it("keeps running compact result output stable at the same render clock when progress is unchanged", () => {
 		const result = {
 			content: [{ type: "text" as const, text: "(running...)" }],
 			details: {
@@ -886,9 +922,10 @@ describe("renderSubagentResult fork indicator", () => {
 				}],
 			},
 		};
-		const first = renderSubagentResult!(result, { expanded: false }, theme).render(120);
-		await new Promise((resolve) => setTimeout(resolve, 120));
-		const second = renderSubagentResult!(result, { expanded: false }, theme).render(120);
+		const [first, second] = withMockedDateNow(0, () => [
+			renderSubagentResult!(result, { expanded: false }, theme).render(120),
+			renderSubagentResult!(result, { expanded: false }, theme).render(120),
+		]);
 
 		assert.deepEqual(second, first);
 	});

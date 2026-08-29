@@ -52,16 +52,28 @@ When you finish implementing, run a reviewer subagent before summarizing.
 
 ### Context-efficient tool surface
 
-The default model-facing `subagent` tool intentionally covers the common paths only: agent listing, one child, and ordinary parallel `calls[]`. Parallel calls are translated internally to the existing `runs.all` workflow engine, so they do not require the large workflow schema.
+This fork keeps the common model-facing contract small: agent listing, one child with `agent`/`task`, and independent parallel `calls[]`. Parallel calls are translated internally to the existing `runs.all` workflow engine.
 
-The uncommon workflow/control contract and `subagent_wait` are progressively disclosed instead of being included in every model request. The small `subagent_capability` loader provides them only when needed:
+Uncommon controls are loaded only when needed:
 
 - `subagent_capability({ mode: "advanced" })` loads the original full `subagent` workflow/control contract.
 - `subagent_capability({ mode: "wait" })` loads `subagent_wait`.
-- `subagent_capability({ mode: "all" })` loads both.
-- The minimal surface is restored after the parent turn finishes.
+- `subagent_capability({ mode: "all" })` loads both in one round trip.
+- The minimal surface is restored automatically after the parent turn.
 
-This changes only the model-facing schema/instructions. The existing executor, async runtime, workflowScript engine, missions, schedules, watchdogs, worktrees, steering, acceptance checks, RPC, and UI remain intact.
+There is deliberately no model-facing manual reset mode. An explicit unload would add another parent-model round trip without improving the next turn.
+
+To measure whether the smaller schema actually saves tokens end to end, run the built-in A/B benchmark with the same model:
+
+```text
+# fresh Pi session
+/bench-subagent progressive
+
+# another fresh Pi session
+/bench-subagent upstream
+```
+
+The second completed run compares total parent input, cache-read, cache-write, and output tokens across the same five-child workload. It also reports model-request count and starting tool-definition bytes. Results are written to `~/.pi/benchmarks/pi-subagents/ab-v5/RESULTS.md`.
 
 ## Builtin agents
 

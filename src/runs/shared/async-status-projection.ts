@@ -87,6 +87,7 @@ export interface AsyncStatusWorkflowRow {
 	state: AsyncJobStep["status"] | HostStepState | "planned";
 	/** Present only for typed host-owned monitor rows; legacy child rows omit it. */
 	kind?: HostStepMonitorKind;
+	context?: AsyncJobStep["context"];
 	modelThinking?: string;
 	activity?: string;
 	startedAt?: number;
@@ -263,7 +264,7 @@ function hostStepSnapshotState(state: HostStepState, verdict: HostStepVerdict | 
 	if (state === "running") return "running";
 	if (state === "cancelled") return "stopped";
 	if (state === "error" || verdict === "fail") return "failed";
-	return verdict === "inconclusive" ? "partial" : "complete";
+	return verdict === undefined || verdict === "inconclusive" ? "partial" : "complete";
 }
 
 function projectHostStep(hostStep: HostStepNodeV1, ctx: ProjectionContext): AsyncStatusSnapshotNodeV1 {
@@ -312,8 +313,12 @@ function projectRun(job: AsyncJobState, ctx: ProjectionContext): AsyncStatusSnap
 		const stepChildren = job.steps?.map((step, index) => projectStep(step, step.index ?? index, 1, ctx)) ?? [];
 		const nestedChildren = job.nestedChildren?.map((child, index) => projectNestedRun(child, index, 1, ctx)) ?? [];
 		const hostStepChildren = validHostStepList(job.hostSteps).map((hostStep) => projectHostStep(hostStep, ctx));
+		const ordinaryChildren = [...stepChildren, ...nestedChildren];
+		const retainedHostSteps = hostStepChildren.slice(0, ctx.caps.maxChildrenPerNode);
+		const retainedOrdinaryChildren = ordinaryChildren.slice(0, ctx.caps.maxChildrenPerNode - retainedHostSteps.length);
 		const bounded: AsyncStatusSnapshotNodeV1[] = [];
-		appendBoundedChildren(bounded, [...stepChildren, ...nestedChildren, ...hostStepChildren], ctx);
+		bounded.push(...retainedOrdinaryChildren, ...retainedHostSteps);
+		ctx.omitted.children += ordinaryChildren.length - retainedOrdinaryChildren.length + hostStepChildren.length - retainedHostSteps.length;
 		if (bounded.length) node.children = bounded;
 	} else {
 		ctx.omitted.children += (job.steps?.length ?? 0) + (job.nestedChildren?.length ?? 0) + validHostStepList(job.hostSteps).length;
@@ -398,12 +403,16 @@ export function projectAsyncWorkflowRows(
 	const hostSteps = isWorkflowPreflight(hostStepsOrPreflight) ? undefined : hostStepsOrPreflight;
 	const loaded = steps ?? [];
 	const declared = new Map<string, WorkflowPreflightLaneV1>();
+	const loadedIndexByKey = new Map<string, number>();
+	for (const [index, step] of loaded.entries()) {
+		if (step.workflowKey !== undefined && !loadedIndexByKey.has(step.workflowKey)) loadedIndexByKey.set(step.workflowKey, index);
+	}
 	const consumed = new Set<number>();
 	const childRows: AsyncStatusWorkflowRow[] = [];
 	for (const lane of preflight?.lanes ?? []) {
 		declared.set(lane.key, lane);
-		const index = loaded.findIndex((step) => step.workflowKey === lane.key);
-		if (index < 0) {
+		const index = loadedIndexByKey.get(lane.key);
+		if (index === undefined) {
 			childRows.push({ name: lane.key, state: "planned", preflight: lane });
 			continue;
 		}
@@ -423,6 +432,7 @@ function projectLoadedWorkflowRow(step: AsyncJobStep, index: number, preflight?:
 	return {
 		name: workflowStepName(step, index),
 		state: step.status,
+		...(step.context ? { context: step.context } : {}),
 		...(modelThinking ? { modelThinking } : {}),
 		...(activity ? { activity } : {}),
 		...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),

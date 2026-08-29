@@ -23,15 +23,11 @@ describe("progressive subagent context surface", () => {
 	it("keeps the default schema materially smaller than the full contract", () => {
 		const basicBytes = bytes(BasicSubagentParams);
 		const fullBytes = bytes(createSubagentParamsSchema());
-
 		assert.ok(basicBytes < 3_500, `basic schema grew to ${basicBytes} bytes`);
-		assert.ok(
-			basicBytes * 4 < fullBytes,
-			`basic schema (${basicBytes} bytes) should stay below 25% of full schema (${fullBytes} bytes)`,
-		);
+		assert.ok(basicBytes * 4 < fullBytes, `basic schema (${basicBytes}) should stay below 25% of full schema (${fullBytes})`);
 	});
 
-	it("keeps common parallel fanout but excludes advanced control fields", () => {
+	it("keeps common fanout and excludes advanced control fields", () => {
 		const schema = JSON.stringify(BasicSubagentParams);
 		assert.match(schema, /calls/);
 		assert.doesNotMatch(schema, /workflowScript/);
@@ -41,29 +37,33 @@ describe("progressive subagent context surface", () => {
 		assert.doesNotMatch(schema, /watchdog/);
 	});
 
-	it("keeps fixed model-facing guidance bounded", () => {
+	it("does not expose an unnecessary manual minimal-reset capability", () => {
+		const schema = JSON.stringify(SubagentCapabilityParams);
+		assert.match(schema, /advanced/);
+		assert.match(schema, /wait/);
+		assert.match(schema, /all/);
+		assert.doesNotMatch(schema, /minimal/);
 		assert.ok(Buffer.byteLength(BASIC_SUBAGENT_TOOL_DESCRIPTION) < 500);
 		assert.ok(bytes(SubagentCapabilityParams) < 600);
 		assert.ok(Buffer.byteLength(SUBAGENT_CAPABILITY_DESCRIPTION) < 120);
 	});
 
-	it("registers the small package surface first and restores the original full contract on demand", () => {
+	it("switches between the compact fork surface and the real upstream contracts", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-context-surface-"));
 		const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
 		delete env.PI_SUBAGENT_CHILD;
 
 		const script = String.raw`
-			import registerSubagentExtension from "./index.ts";
+			import registerContextSurface from "./src/extension/context-surface.ts";
 			const registered = new Map();
 			let activeTools = ["read", "bash", "edit", "write", "subagent", "subagent_capability"];
-			const events = { on() { return () => {}; }, emit() {} };
 			const fakePi = new Proxy({
-				events,
 				registerTool(tool) { registered.set(tool.name, tool); },
 				registerCommand() {},
 				registerShortcut() {},
 				registerMessageRenderer() {},
 				sendMessage() {},
+				on() { return () => {}; },
 				getSessionName() { return undefined; },
 				getActiveTools() { return activeTools; },
 				setActiveTools(next) { activeTools = [...next]; },
@@ -74,16 +74,38 @@ describe("progressive subagent context surface", () => {
 				},
 			});
 
-			registerSubagentExtension(fakePi);
+			const controller = registerContextSurface(fakePi);
 			const initial = registered.get("subagent");
 			const capability = registered.get("subagent_capability");
-			if (!initial || !capability) throw new Error("optimized tools were not registered");
+			if (!initial || !capability) throw new Error("progressive tools were not registered");
 			const initialProperties = Object.keys(initial.parameters.properties ?? {});
 			const waitInitiallyRegistered = registered.has("subagent_wait");
-			await capability.execute("capability-test", { mode: "advanced" }, undefined, undefined, undefined);
-			const advanced = registered.get("subagent");
-			const advancedProperties = Object.keys(advanced.parameters.properties ?? {});
-			process.stdout.write(JSON.stringify({ initialProperties, waitInitiallyRegistered, advancedProperties }));
+
+			controller.useUpstreamSurface();
+			const upstream = registered.get("subagent");
+			const upstreamProperties = Object.keys(upstream.parameters.properties ?? {});
+			const upstreamActive = [...activeTools];
+
+			controller.useProgressiveSurface();
+			const restored = registered.get("subagent");
+			const restoredProperties = Object.keys(restored.parameters.properties ?? {});
+			const restoredActive = [...activeTools];
+
+			await capability.execute("capability-test", { mode: "all" }, undefined, undefined, undefined);
+			const loaded = registered.get("subagent");
+			const loadedProperties = Object.keys(loaded.parameters.properties ?? {});
+			const loadedActive = [...activeTools];
+
+			process.stdout.write(JSON.stringify({
+				initialProperties,
+				waitInitiallyRegistered,
+				upstreamProperties,
+				upstreamActive,
+				restoredProperties,
+				restoredActive,
+				loadedProperties,
+				loadedActive,
+			}));
 			process.exit(0);
 		`;
 
@@ -102,14 +124,25 @@ describe("progressive subagent context surface", () => {
 		const result = JSON.parse(output) as {
 			initialProperties: string[];
 			waitInitiallyRegistered: boolean;
-			advancedProperties: string[];
+			upstreamProperties: string[];
+			upstreamActive: string[];
+			restoredProperties: string[];
+			restoredActive: string[];
+			loadedProperties: string[];
+			loadedActive: string[];
 		};
 
 		assert.equal(result.waitInitiallyRegistered, false);
 		assert.equal(result.initialProperties.includes("calls"), true);
 		assert.equal(result.initialProperties.includes("workflowScript"), false);
-		assert.equal(result.initialProperties.includes("mission"), false);
-		assert.equal(result.advancedProperties.includes("workflowScript"), true);
-		assert.equal(result.advancedProperties.includes("mission"), true);
+		assert.equal(result.upstreamProperties.includes("workflowScript"), true);
+		assert.equal(result.upstreamActive.includes("subagent_wait"), true);
+		assert.equal(result.upstreamActive.includes("subagent_capability"), false);
+		assert.equal(result.restoredProperties.includes("calls"), true);
+		assert.equal(result.restoredProperties.includes("workflowScript"), false);
+		assert.equal(result.restoredActive.includes("subagent_wait"), false);
+		assert.equal(result.restoredActive.includes("subagent_capability"), true);
+		assert.equal(result.loadedProperties.includes("workflowScript"), true);
+		assert.equal(result.loadedActive.includes("subagent_wait"), true);
 	});
 });

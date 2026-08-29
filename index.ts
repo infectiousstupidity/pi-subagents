@@ -10,6 +10,6 @@ const registerBenchmarkCommand = isSubagentChild
 	: (await import("./src/extension/benchmark-command.ts")).registerBenchmarkCommand;
 
 export default function registerSubagentExtension(pi: ExtensionAPI): void {
-	registerParentExtension?.(pi);
-	registerBenchmarkCommand?.(pi);
+	const surfaceController = registerParentExtension?.(pi);
+	if (surfaceController && registerBenchmarkCommand) registerBenchmarkCommand(pi, surfaceController);
 }

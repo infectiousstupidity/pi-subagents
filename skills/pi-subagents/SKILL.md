@@ -1,64 +1,83 @@
 ---
 name: pi-subagents
-description: Delegate work to child AI agents with isolated context. Use for delegation, parallel research, plan-then-execute workflows, and multi-agent orchestration.
+description: |
+  Delegate to builtin or custom subagents for single-agent handoffs, parallel
+  review, scripted chaining, async work, forked context, and coordinated
+  workflows. Use when one parent agent should stay in control while children
+  supply focused context, planning, review, or execution.
 ---
 
 # Pi Subagents
 
-Delegate to child agents with the `subagent` tool.
+Parent owns orchestration. Children do not spawn subagents unless the parent
+explicitly delegated fanout and their resolved `tools` allow `subagent`.
 
-## Use the Progressive-Disclosure Surfaces
+## Progressive tool surface
 
-The extension injects compact guidance plus a generated `## Agents` catalog into the system prompt. Treat that catalog as the source of truth for available agent names and descriptions.
+The default `subagent` contract is intentionally small. Use direct `{ agent, task }`
+for one child and `calls[]` for ordinary independent fanout.
 
-Do not read `agents/*.md` just to discover agents. Load agent prompt files only when you need their implementation details.
+Load uncommon controls only when needed:
 
-## Single
+- `subagent_capability({ mode: "advanced" })` for `workflowScript`, management actions, missions, schedules, watchdogs, and other advanced controls.
+- `subagent_capability({ mode: "wait" })` for `subagent_wait`.
+- `subagent_capability({ mode: "all" })` when both are needed in the same parent turn.
 
-```json
-{"agent":"scout","task":"Find auth logic and summarize files"}
-```
+Do not unload capabilities manually. The minimal surface is restored automatically
+after the parent turn.
 
-Use background execution only for independent work. In `single` and `parallel` modes, set `background: true`.
+## Launch shape
 
-## Parallel
+| Need | Use |
+| --- | --- |
+| One disposable child | direct `{ agent, task }` |
+| Independent parallel children | compact `calls[]` |
+| Sequence, retry, gate monitor, retained resume, cross-repo wave, or aggregate result | load advanced, then `workflowScript` |
+| Council of advisors | `../council-mode/SKILL.md` |
+| Management, status, steering, authoring, or inspection | load advanced, then `action` |
 
-```json
-{"tasks":[
-  {"agent":"scout","task":"Trace caching logic"},
-  {"agent":"researcher","task":"Check current caching guidance"}
-]}
-```
+`workflowScript` is code-driven: `runs.run(...)` for keyed steps,
+`runs.all([...])` for fanout, plain JavaScript for branching and aggregation.
+Keep scripts portable: use top-level `await`, plain helpers, or explicit Promise
+chains, not nested async helpers. Legacy top-level `chain` / `tasks` inputs and
+durable `.chain.md` execution are inspection or migration material only.
 
-Parallel results preserve task order. The default concurrency limit is 4.
+Use async/background by default. Set `async:false` only when the parent must
+block. Final reviews, validation gates, oracle checks, and publication checks
+stay async.
 
-## Chain
+Package agents appear in `subagent({ action: "list" })`. External CLI/job agents
+use their own runner contract. Do not pass native Pi child options to them unless
+that runner explicitly supports the option.
 
-Use `{previous}` to pass the previous step's output into the next step.
+## Read the reference for the branch
 
-```json
-{"chain":[
-  {"agent":"scout","task":"Locate auth code"},
-  {"agent":"planner","task":"Design a fix from: {previous}"},
-  {"agent":"worker","task":"Implement: {previous}"}
-]}
-```
+| Branch | Read |
+| --- | --- |
+| Delegate or choose roles, prompts, models, or slash commands | `references/prompting-and-roles.md` |
+| Execute single, scripted, async, scheduled, mission, forked, watchdog, oracle, or intercom workflows | `references/execution-controls.md` |
+| Review, validate, triage gate failures, or prepare delivery | `references/review-and-validation.md` |
+| Coordinate lanes, worktrees, repositories, or writer waves | `references/multi-lane-orchestration.md` |
+| List, create, edit, disable, eject, or expose agents/RPC | `references/management-authoring-rpc.md` |
+| Check safety constraints, recipes, or error handling | `references/constraints-and-recipes.md` |
 
-Do not set `background` in chain mode.
+For complex work, read `prompting-and-roles.md` and `execution-controls.md`, then
+load `review-and-validation.md` and `constraints-and-recipes.md` before launch or
+review.
 
-## Non-Interactive Subagents
+## Operating rules
 
-Child agents cannot answer interactive questions. Give them complete tasks up front.
-
-For repo-local tasks, provide paths, constraints, expected output, and any facts already known from the parent session. Do not assume child agents inherit parent context.
-
-## External CLI Agents
-
-External CLI agents run through the configured runner contract. Do not pass Pi-native child-agent options (for example `turnBudget`) unless that runner explicitly supports them.
-
-## Common Errors
-
-- Unknown agent: choose a name from the injected `## Agents` catalog.
-- Invalid parameters: use exactly one mode: `agent` + `task`, `tasks`, or `chain`.
-- Chain prompt bug: ensure later chain steps include `{previous}` when they depend on earlier output.
-- Background misuse: use it only for `single` or `parallel`.
+- Delegate only when a child improves evidence, independent review, or isolated execution.
+- Keep the parent on the ordinary strong default model. Route workers/scouts to a fast capable tier, serious reviews to a strong tier, and top reasoning to bounded read-only critique.
+- Exact model names are deployment policy. Put them in user/project settings or profiles, not package guidance.
+- Give every child a cold-start packet: goal, target/cwd/ref, authority, edit boundary, context/evidence, success criteria, validation, output, and stop rules.
+- Keep one writer per cwd/worktree. Parallel writers need isolated worktrees and a lane board.
+- For cross-codebase work, record the repo, explicit `cwd`, authority boundary, and expected output before launch.
+- Make parallel prompts distinct by source seam, evidence, and decision. Do not clone prompts with only item numbers swapped.
+- Prefer fresh-context review/validation fanout, then synthesize and apply fixes in the parent.
+- For Pi extension repos under `~/.pi/agent/extensions`, put lane worktrees outside extension auto-discovery, such as `~/.pi/agent/worktrees`.
+- Preserve capability ceilings, including child tool limits and allowed-agent restrictions.
+- Escalate unresolved product, architecture, authority, release, merge, or safety decisions.
+- Treat receipts, CI, review bots, and external-run records as evidence, not authority.
+- For backlog maintenance, releases, merge queues, or other public-repo mutation policy, load the matching user/project skill. This package defines delegation primitives, not private policy.
+- As a conservative orchestration policy, do not pass a hard `toolBudget` or tight `usageBudget` to mutation-capable workers. The default tool budget blocks read/search tools rather than mutation tools. If interrupted after a tool call starts, checkpoint after the current tool returns with changed files, build/test state, and commit or PR state.

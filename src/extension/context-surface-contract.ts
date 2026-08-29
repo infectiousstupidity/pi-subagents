@@ -9,12 +9,7 @@ const BasicSubagentCall = Type.Object({
 	task: Type.String({ description: "Task for this child." }),
 }, { additionalProperties: false });
 
-/**
- * Small parent-facing contract used for the common delegation paths.
- *
- * Keep this intentionally narrow. The full historical subagent schema is
- * captured by context-surface.ts and restored only when genuinely needed.
- */
+/** Small parent-facing contract for the common delegation paths. */
 export const BasicSubagentParams = Type.Object({
 	action: Type.Optional(Type.String({
 		enum: ["list"],
@@ -46,8 +41,8 @@ export const BASIC_SUBAGENT_PROMPT_SNIPPET =
 
 export const SubagentCapabilityParams = Type.Object({
 	mode: Type.String({
-		enum: ["advanced", "wait", "all", "minimal"],
-		description: "Load advanced subagent controls, subagent_wait, both, or restore the minimal surface.",
+		enum: ["advanced", "wait", "all"],
+		description: "Load advanced subagent controls, subagent_wait, or both for the current parent turn.",
 	}),
 }, { additionalProperties: false });
 
