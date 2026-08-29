@@ -50,6 +50,31 @@ Installing the extension does not start an automatic reviewer in the background.
 When you finish implementing, run a reviewer subagent before summarizing.
 ```
 
+### Context-efficient tool surface
+
+This fork keeps the common model-facing contract small: agent listing, one child with `agent`/`task`, and independent parallel `calls[]`. Parallel calls are translated internally to the existing `runs.all` workflow engine.
+
+Uncommon controls are loaded only when needed:
+
+- `subagent_capability({ mode: "advanced" })` loads the original full `subagent` workflow/control contract.
+- `subagent_capability({ mode: "wait" })` loads `subagent_wait`.
+- `subagent_capability({ mode: "all" })` loads both in one round trip.
+- The minimal surface is restored automatically after the parent turn.
+
+There is deliberately no model-facing manual reset mode. An explicit unload would add another parent-model round trip without improving the next turn.
+
+To measure whether the smaller schema actually saves tokens end to end, run the built-in A/B benchmark with the same model:
+
+```text
+# fresh Pi session
+/bench-subagent progressive
+
+# another fresh Pi session
+/bench-subagent upstream
+```
+
+The second completed run compares total parent input, cache-read, cache-write, and output tokens across the same five-child workload. It also reports model-request count and starting tool-definition bytes. Results are written to `~/.pi/benchmarks/pi-subagents/ab-v5/RESULTS.md`.
+
 ## Builtin agents
 
 The extension ships with agents you can use immediately:
@@ -107,7 +132,7 @@ For bounded orchestration, `maxSubagentSpawnsPerRun` limits cumulative logical c
 
 or ask: "Check whether subagents and intercom are set up correctly."
 
-For installed-version help, use `/subagents-guide [topic]` or `subagent({ action: "guide", topic: "workflows" })`. The default topic is `overview`; available topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, and `extension-api`.
+For installed-version help, use `/subagents-guide [topic]`. For model-driven advanced guide actions, Pi first loads the advanced `subagent` surface through `subagent_capability`. The default topic is `overview`; available topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, and `extension-api`.
 
 ## Documentation
 
