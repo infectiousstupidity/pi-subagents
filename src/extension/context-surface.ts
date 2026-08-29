@@ -206,8 +206,10 @@ export default function registerContextOptimizedSubagentExtension(pi: ExtensionA
 		},
 	};
 	pi.registerTool(capabilityTool);
-	useProgressiveSurface();
 
+	// Active-tool changes are action methods that only work after the extension
+	// runtime is bound at session start; applying the surface here (during
+	// extension loading) throws. session_start is the earliest safe point.
 	pi.on("session_start", useProgressiveSurface);
 	pi.on("agent_end", useProgressiveSurface);
 
